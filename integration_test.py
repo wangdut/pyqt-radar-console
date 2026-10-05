@@ -126,6 +126,26 @@ ok7t = tester.shapes is not None
 print("地图->测试台:", "通过" if ok7t else "失败/未就绪")
 print("陆地抽样点数:", [len(r) for r in (scope.shapes["land"] if ok7 else [])][:6])
 
-all_ok = ok1 and ok2 and ok3 and ok4 and ok5 and ok6 and ok7 and ok7t
+# ---------- 8. 反向数据链：雷达->测试台 DEL（攻击击沉后同步移除） ----------
+tester.ed_name.setText("SINK-ME")
+tester.spn_x.setValue(2.0)
+tester.spn_y.setValue(1.5)
+tester.spn_spd.setValue(6.0)
+tester.spn_hdg.setValue(90)
+tester.add_target()
+t0 = time.time()
+while time.time() - t0 < 1.5 and not any(c.name == "SINK-ME" for c in scope.contacts):
+    app.processEvents()
+    time.sleep(0.02)
+# 模拟攻击模块击沉后雷达向测试台回传 DEL
+scope._send_cmd("DEL,SINK-ME")
+t0 = time.time()
+while time.time() - t0 < 1.0 and "SINK-ME" in tester.targets:
+    app.processEvents()
+    time.sleep(0.02)
+ok8 = "SINK-ME" not in tester.targets
+print("雷达->测试台击沉同步DEL:", "通过" if ok8 else "失败")
+
+all_ok = ok1 and ok2 and ok3 and ok4 and ok5 and ok6 and ok7 and ok7t and ok8
 print("==>", "全部通过" if all_ok else "存在失败项")
 sys.exit(0 if all_ok else 1)

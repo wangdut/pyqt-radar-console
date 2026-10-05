@@ -533,8 +533,20 @@ class AttackView(QDialog):
             p.scale(-1, 1)
         p.translate(-ex, -ey)
         draw_warship(p, ex, ey, s, max(0.0, e.hp) / 1000.0,
-                     time.time() - self.time0)
+                     time.time() - self.time0, e.sinking)
         p.restore()
+        # 敌舰濒死/沉没时的额外全舰闪光与冲击波
+        if e.hp <= 0 and e.sinking < 0.8:
+            k = e.sinking / 0.8
+            sc = max(1.2, min(4.0, 12000.0 / max(e.rng, 600.0)))
+            g = QRadialGradient(QPointF(ex, ey - 15 * s), (30 + 90 * k) * sc)
+            g.setColorAt(0, QColor(255, 230, 180, int(160 * (1 - k))))
+            g.setColorAt(0.5, QColor(255, 120, 40, int(90 * (1 - k))))
+            g.setColorAt(1, QColor(120, 40, 15, 0))
+            p.setPen(QPen(Qt.NoPen))
+            p.setBrush(g)
+            p.drawEllipse(QPointF(ex, ey - 15 * s), (30 + 90 * k) * sc,
+                          (24 + 72 * k) * sc)
         if self.enemy_flash > 0:                  # 敌舰炮口闪光
             fr = self.enemy_flash / 0.3
             g = QRadialGradient(QPointF(ex - SHIP_LEN * s * 0.3, ey - 12 * s),
@@ -548,22 +560,57 @@ class AttackView(QDialog):
 
     def _paint_torps(self, p, cx, horizon, f, w, h):
         """鱼雷航迹：世界系惯性直线换算为相对本船方位后绘制，
-        本船转向时已发出的鱼雷保持自己的航迹而不跟着扫。"""
+        本船转向时已发出的鱼雷保持自己的航迹而不跟着扫。
+        新版：尾流泡沫带、航行灯、气泡环、潜望镜浪花。"""
         ow = self.own_world
         ox, oy = ow["x"] * 1852.0, ow["y"] * 1852.0
         hd = math.radians(ow["hdg"])
+        now = time.time()
         for tp in self.torps:
             rel = _norm(math.atan2(tp["x"] - ox, tp["y"] - oy) - hd)
             k = min(1.0, tp["d"] / 4000.0)
             x = cx + (rel - self.aim_brg) * f * (1 - k * 0.55)
             y = h - (h - horizon) * k * 0.92
-            p.setPen(QPen(QColor(200, 230, 255, 130), 1))
-            p.drawLine(QPointF(x, y + 16), QPointF(x, y))
-            p.setPen(QPen(QColor(230, 245, 255, 200), 2.5))
-            p.drawPoint(QPointF(x, y))
-            p.setPen(QPen(QColor(160, 200, 220, 60), 1))
-            p.drawEllipse(QPointF(x, y), 5 + 3 * math.sin(time.time() * 6),
-                          3)
+            # 尾流泡沫点（随距离消散）
+            wake_alpha = int(140 * (1.0 - k * 0.7))
+            p.setPen(QPen(Qt.NoPen))
+            for i in range(12):
+                fk = i / 11.0
+                wx = x - math.sin(rel) * fk * 35 * (1 - k * 0.3)
+                wy = y + 8 + fk * 22 + math.sin(now * 8 + i * 1.3) * 2
+                a = int(wake_alpha * (1.0 - fk * 0.6))
+                if a <= 2:
+                    continue
+                p.setBrush(QColor(210, 240, 255, a))
+                rr = (1.2 + 1.8 * (1.0 - fk)) * (1.0 - k * 0.3)
+                p.drawEllipse(QPointF(wx, wy), rr, rr * 0.6)
+            # 尾迹中线
+            p.setPen(QPen(QColor(190, 225, 245, int(100 * (1.0 - k * 0.5))), 1))
+            p.drawLine(QPointF(x, y + 18), QPointF(x, y + 4))
+            # 鱼雷本体（水滴形）
+            p.setPen(QPen(QColor(30, 44, 58), 1))
+            p.setBrush(QColor(100, 120, 138))
+            p.drawEllipse(QPointF(x, y + 2), 4.5, 8)
+            p.setBrush(QColor(60, 80, 100))
+            p.drawEllipse(QPointF(x, y + 7), 2.5, 4)
+            # 螺旋桨水花
+            p.setPen(QPen(Qt.NoPen))
+            p.setBrush(QColor(220, 245, 255, int(160 * (1.0 - k * 0.4))))
+            for i in range(4):
+                a = now * 18 + i * 1.57
+                px = x + math.cos(a) * 4
+                py = y + 11 + math.sin(a) * 2
+                p.drawEllipse(QPointF(px, py), 1.6, 1.0)
+            # 航行灯
+            p.setBrush(QColor(255, 60, 60, 200))
+            p.drawEllipse(QPointF(x - 3, y + 1), 1.4, 1.4)
+            p.setBrush(QColor(60, 255, 120, 200))
+            p.drawEllipse(QPointF(x + 3, y + 1), 1.4, 1.4)
+            # 气泡环
+            ring = 5 + 2.5 * math.sin(now * 6)
+            p.setPen(QPen(QColor(170, 210, 230, int(70 * (1.0 - k * 0.5))), 1))
+            p.setBrush(Qt.NoBrush)
+            p.drawEllipse(QPointF(x, y + 3), ring, ring * 0.6)
 
     def _paint_effects(self, p, cx, horizon, f, w, h):
         now = time.time()
@@ -613,32 +660,74 @@ class AttackView(QDialog):
 
     def _explosion(self, p, x, y, k, scale=1.0):
         """通用分层爆炸：冲击波圈（快速扩散消失）→ 白核橙边火球 →
-        上升消停黑烟。k 为 0~1 进度，scale 控制尺寸。"""
+        飞溅火星/破片 → 上升消停黑烟。k 为 0~1 进度，scale 控制尺寸。"""
         p.setPen(QPen(Qt.NoPen))
-        if k < 0.5:                             # 冲击波圈
-            rr = (16 + 110 * k) * scale
+        if k < 0.45:                            # 冲击波圈
+            rr = (18 + 130 * k) * scale
             p.setBrush(Qt.NoBrush)
-            p.setPen(QPen(QColor(255, 240, 200, int(190 * (1 - k / 0.5))), 2))
+            p.setPen(QPen(QColor(255, 245, 210, int(200 * (1 - k / 0.45))), 2.5))
             p.drawEllipse(QPointF(x, y), rr, rr * 0.6)
-        if k < 0.6:                             # 火球阶段
-            kf = k / 0.6
-            r = (30 + 62 * kf) * scale
+            # 内部二次冲击环
+            rr2 = (8 + 70 * k) * scale
+            p.setPen(QPen(QColor(255, 220, 160, int(120 * (1 - k / 0.45))), 1.5))
+            p.drawEllipse(QPointF(x, y), rr2, rr2 * 0.55)
+        if k < 0.65:                            # 火球阶段
+            kf = k / 0.65
+            r = (32 + 72 * kf) * scale
             g = QRadialGradient(QPointF(x, y), r)
-            g.setColorAt(0, QColor(255, 255, 230, int(255 * (1 - kf))))
-            g.setColorAt(0.4, QColor(255, 185, 70, int(235 * (1 - kf))))
-            g.setColorAt(0.75, QColor(230, 80, 30, int(170 * (1 - kf))))
-            g.setColorAt(1, QColor(80, 30, 15, 0))
+            g.setColorAt(0, QColor(255, 255, 235, int(255 * (1 - kf))))
+            g.setColorAt(0.30, QColor(255, 200, 75, int(245 * (1 - kf))))
+            g.setColorAt(0.60, QColor(255, 120, 40, int(190 * (1 - kf))))
+            g.setColorAt(0.85, QColor(180, 50, 20, int(100 * (1 - kf))))
+            g.setColorAt(1, QColor(80, 25, 10, 0))
             p.setPen(QPen(Qt.NoPen))
             p.setBrush(g)
-            p.drawEllipse(QPointF(x, y), r, r * 0.85)
-        ks = min(1.0, k / 0.9)                  # 浓烟滞留上升
-        r2 = (22 + 86 * k) * scale
-        g2 = QRadialGradient(QPointF(x, y - 26 * scale * ks), r2)
-        g2.setColorAt(0, QColor(46, 40, 36, int(160 * (1 - ks))))
-        g2.setColorAt(1, QColor(26, 22, 20, 0))
+            p.drawEllipse(QPointF(x, y), r, r * 0.88)
+            # 火舌
+            for i in range(6):
+                a = i * 1.047 + k * 4.0
+                lg = (12 + 24 * (1 - kf)) * scale
+                px = x + math.cos(a) * lg * 0.6
+                py = y + math.sin(a) * lg * 0.45
+                p.setBrush(QColor(255, int(150 + 80 * kf), 30,
+                                  int(180 * (1 - kf))))
+                p.drawEllipse(QPointF(px, py), 6 * scale, 8 * scale)
+        # 飞溅火星 / 破片
+        if k < 0.8:
+            kf = k / 0.8
+            p.setPen(QPen(Qt.NoPen))
+            for i in range(16):
+                seed = i * 7 + 11
+                rnd = random.Random(seed)
+                ang = rnd.uniform(0, 6.283)
+                dist = (10 + 55 * kf) * scale * rnd.uniform(0.5, 1.0)
+                px = x + math.cos(ang) * dist
+                py = y - 12 * kf * scale + math.sin(ang) * dist * 0.5
+                life = 1.0 - kf
+                c = QColor(255, int(180 + 60 * life), 50,
+                           int(230 * life * rnd.uniform(0.6, 1.0)))
+                p.setBrush(c)
+                r = (1.0 + 2.2 * life) * scale
+                p.drawEllipse(QPointF(px, py), r, r)
+        ks = min(1.0, k / 0.92)                 # 浓烟滞留上升
+        r2 = (24 + 95 * k) * scale
+        g2 = QRadialGradient(QPointF(x, y - 30 * scale * ks), r2)
+        g2.setColorAt(0, QColor(52, 46, 42, int(170 * (1 - ks))))
+        g2.setColorAt(0.55, QColor(38, 34, 30, int(120 * (1 - ks))))
+        g2.setColorAt(1, QColor(22, 20, 18, 0))
         p.setPen(QPen(Qt.NoPen))
         p.setBrush(g2)
-        p.drawEllipse(QPointF(x, y - 26 * scale * ks), r2, r2 * 0.78)
+        p.drawEllipse(QPointF(x, y - 30 * scale * ks), r2, r2 * 0.78)
+        #  secondary smoke puff
+        if k > 0.25:
+            ks2 = min(1.0, (k - 0.25) / 0.75)
+            r3 = (18 + 70 * ks2) * scale
+            g3 = QRadialGradient(QPointF(x + 10 * scale, y - 45 * scale * ks2), r3)
+            g3.setColorAt(0, QColor(60, 54, 50, int(100 * (1 - ks2))))
+            g3.setColorAt(1, QColor(30, 28, 26, 0))
+            p.setBrush(g3)
+            p.drawEllipse(QPointF(x + 10 * scale, y - 45 * scale * ks2),
+                          r3, r3 * 0.75)
 
     def _water_column(self, p, x, y, hgt, col, alpha):
         a = max(0, int(200 * alpha))
@@ -669,11 +758,13 @@ class AttackView(QDialog):
 
     def _gun_geometry(self, w, h, cx):
         """本船炮几何：方位角→炮管倾角、俯仰→抬升（限幅），
-        返回 (az_deg, lift, 炮口屏幕坐标) 供绘制与弹丸起点共用。"""
+        返回 (az_deg, lift, 炮口屏幕坐标) 供绘制与弹丸起点共用。
+        数值与 _paint_gun 中三联装主炮中心炮管静止炮口对齐。"""
         az_deg = max(-38.0, min(38.0, math.degrees(self.aim_brg) * 2.4))
         lift = min(90.0, self.aim_elev * 1200.0)
-        mz_x = cx + math.sin(math.radians(az_deg)) * 230.0
-        mz_y = h - 26 - 250.0 - lift
+        gun_len = 234.0 + lift
+        mz_x = cx + math.sin(math.radians(az_deg)) * gun_len
+        mz_y = h - 26 - 68.0 - math.cos(math.radians(az_deg)) * gun_len
         return az_deg, lift, mz_x, mz_y
 
     def _paint_shots(self, p, cx, horizon, f, w, h):
@@ -710,97 +801,134 @@ class AttackView(QDialog):
             p.drawEllipse(QPointF(px_, py_), 8, 8)
 
     def _paint_gun(self, p, w, h, cx):
-        """屏幕下方本船主炮剪影：炮座转盘环 + 梯形缩厚装甲炮塔
-        （金属渐变/顶盖/测距仪鼓包/装甲缝高光）+ 双炮身（耳轴座、
-        炮尾衬套、变细炮身带高光、炮口箍）；方位→炮塔前整体左右
-        旋转，俯仰→炮口上抬（限幅），另然后坐/炮口焰。"""
+        """屏幕下方本船主炮剪影：精细化炮舰甲板、炮座转盘环、装甲炮塔
+        （金属渐变/顶盖/测距仪鼓包/装甲缝高光/炮盾铆钉）+ 三联装炮身
+        （耳轴座、炮尾衬套、液压驻退筒、变细炮身带高光、炮口箍）；
+        方位→炮塔前整体左右旋转，俯仰→炮口上抬（限幅），另然后坐/炮口焰。"""
         base_y = h - 26
         az_deg, lift, _, _ = self._gun_geometry(w, h, cx)
-        rec = self.recoil * 16
+        rec = self.recoil * 18
         p.setPen(QPen(Qt.NoPen))
-        # 炮舰甲板：梯形剪影 + 甲板边缘线
-        deck = QLinearGradient(0, base_y - 6, 0, h)
-        deck.setColorAt(0, QColor(24, 36, 48))
-        deck.setColorAt(1, QColor(7, 12, 20))
+        # 炮舰甲板：梯形剪影 + 木质甲板纹理 + 甲板边缘线
+        deck = QLinearGradient(0, base_y - 8, 0, h)
+        deck.setColorAt(0, QColor(28, 42, 56))
+        deck.setColorAt(1, QColor(8, 14, 22))
         path = QPainterPath()
-        path.moveTo(cx - 340, h)
-        path.lineTo(cx - 235, base_y - 6)
-        path.lineTo(cx + 235, base_y - 6)
-        path.lineTo(cx + 340, h)
+        path.moveTo(cx - 360, h)
+        path.lineTo(cx - 250, base_y - 8)
+        path.lineTo(cx + 250, base_y - 8)
+        path.lineTo(cx + 360, h)
         path.closeSubpath()
         p.setBrush(deck)
         p.drawPath(path)
-        p.setPen(QPen(QColor(74, 96, 116, 110), 1))
-        p.drawLine(QPointF(cx - 235, base_y - 6),
-                   QPointF(cx + 235, base_y - 6))
-        # 炮座转盘环（两层椭圆）
-        p.setPen(QPen(QColor(10, 16, 24), 1))
-        p.setBrush(QColor(18, 28, 40))
-        p.drawEllipse(QPointF(cx, base_y - 10), 104, 15)
-        p.setBrush(QColor(30, 44, 58))
-        p.drawEllipse(QPointF(cx, base_y - 16), 86, 12)
-        # 炮塔主体：梯形缩厚装甲，顶亮底暗金属渐变
-        body = QLinearGradient(0, base_y - 110, 0, base_y - 24)
-        body.setColorAt(0, QColor(58, 76, 94))
-        body.setColorAt(0.55, QColor(32, 46, 62))
-        body.setColorAt(1, QColor(13, 20, 30))
+        # 甲板横向铺板线
+        p.setPen(QPen(QColor(52, 70, 88, 90), 1))
+        for yy in range(int(base_y), h, 18):
+            p.drawLine(QPointF(cx - 250 + (yy - base_y) * 0.25, yy),
+                       QPointF(cx + 250 - (yy - base_y) * 0.25, yy))
+        p.setPen(QPen(QColor(86, 110, 132, 130), 1.5))
+        p.drawLine(QPointF(cx - 250, base_y - 8),
+                   QPointF(cx + 250, base_y - 8))
+        # 炮座转盘环（三层椭圆，带锯齿状炮塔座圈）
+        p.setPen(QPen(QColor(8, 14, 22), 1))
+        p.setBrush(QColor(16, 26, 38))
+        p.drawEllipse(QPointF(cx, base_y - 12), 114, 18)
+        p.setBrush(QColor(26, 40, 54))
+        p.drawEllipse(QPointF(cx, base_y - 18), 96, 14)
+        p.setBrush(QColor(40, 56, 72))
+        p.drawEllipse(QPointF(cx, base_y - 24), 78, 10)
+        # 炮塔主体：更厚重的梨形装甲，顶亮底暗金属渐变
+        body = QLinearGradient(0, base_y - 128, 0, base_y - 26)
+        body.setColorAt(0, QColor(72, 92, 112))
+        body.setColorAt(0.45, QColor(44, 62, 82))
+        body.setColorAt(0.85, QColor(24, 38, 54))
+        body.setColorAt(1, QColor(10, 18, 28))
         t = QPainterPath()
-        t.moveTo(cx - 92, base_y - 24)
-        t.lineTo(cx - 74, base_y - 96)
-        t.lineTo(cx + 74, base_y - 96)
-        t.lineTo(cx + 92, base_y - 24)
+        t.moveTo(cx - 102, base_y - 26)
+        t.quadTo(cx - 86, base_y - 70, cx - 78, base_y - 108)
+        t.lineTo(cx + 78, base_y - 108)
+        t.quadTo(cx + 86, base_y - 70, cx + 102, base_y - 26)
         t.closeSubpath()
-        p.setPen(QPen(QColor(8, 14, 22), 1.5))
+        p.setPen(QPen(QColor(6, 12, 20), 2))
         p.setBrush(body)
         p.drawPath(t)
+        # 炮塔正面装甲板分割线
+        p.setPen(QPen(QColor(110, 140, 168, 80), 1))
+        p.drawLine(QPointF(cx - 60, base_y - 34), QPointF(cx - 50, base_y - 102))
+        p.drawLine(QPointF(cx + 60, base_y - 34), QPointF(cx + 50, base_y - 102))
         # 顶盖与测距仪鼓包
         p.setPen(QPen(QColor(10, 16, 26), 1))
-        p.setBrush(QColor(64, 84, 104))
-        p.drawRoundedRect(QRectF(cx - 76, base_y - 108, 152, 14), 4, 4)
-        p.setBrush(QColor(46, 62, 80))
-        p.drawRoundedRect(QRectF(cx - 20, base_y - 122, 40, 16), 5, 5)
+        cap_grad = QLinearGradient(0, base_y - 122, 0, base_y - 108)
+        cap_grad.setColorAt(0, QColor(88, 110, 132))
+        cap_grad.setColorAt(1, QColor(56, 76, 96))
+        p.setBrush(cap_grad)
+        p.drawRoundedRect(QRectF(cx - 84, base_y - 118, 168, 16), 5, 5)
+        p.setBrush(QColor(52, 72, 92))
+        p.drawRoundedRect(QRectF(cx - 24, base_y - 138, 48, 20), 6, 6)
+        # 测距仪镜筒
+        p.setPen(QPen(QColor(14, 22, 32), 1))
+        p.setBrush(QColor(70, 90, 112))
+        p.drawRoundedRect(QRectF(cx - 34, base_y - 134, 68, 8), 3, 3)
         # 装甲缝高光
-        p.setPen(QPen(QColor(126, 156, 182, 60), 1))
-        p.drawLine(QPointF(cx - 70, base_y - 92), QPointF(cx + 70, base_y - 92))
-        p.drawLine(QPointF(cx - 88, base_y - 32), QPointF(cx + 88, base_y - 32))
-        # 火炮：方位整体旋转，俯仰/后坐沿纵深方向抬升
+        p.setPen(QPen(QColor(140, 172, 200, 75), 1.2))
+        p.drawLine(QPointF(cx - 76, base_y - 100), QPointF(cx + 76, base_y - 100))
+        p.drawLine(QPointF(cx - 96, base_y - 34), QPointF(cx + 96, base_y - 34))
+        # 炮盾铆钉线
+        p.setPen(QPen(QColor(100, 128, 154, 100), 1))
+        for sx in (-80, 80):
+            for i in range(5):
+                yy = base_y - 42 - i * 14
+                p.drawPoint(QPointF(cx + sx * 0.95, yy))
+        # 火炮：方位整体旋转，俯仰/后坐沿纵深方向抬升（三联装）
         p.save()
-        p.translate(cx, base_y - 60)
+        p.translate(cx, base_y - 68)
         p.rotate(az_deg)
-        piv_y = -40.0                                   # 耳轴轴心（局部坐标）
-        tip_y = piv_y - (178.0 + lift) - rec             # 炮口：俯仰抬高+后坐
-        for xb in (-27.0, 27.0):                         # 左右炮身轴
-            tip_x = xb * 0.62                             # 炮口略微内收
-            p.setPen(QPen(QColor(10, 16, 24), 1))
-            p.setBrush(QColor(38, 52, 68))                # 耳轴座/炮盾
-            p.drawRoundedRect(QRectF(xb - 14, piv_y - 14, 28, 30), 5, 5)
-            p.setBrush(QColor(54, 72, 92))                # 炮尾衬套环
-            p.drawRoundedRect(QRectF(xb - 9, piv_y - 24, 18, 12), 3, 3)
+        piv_y = -46.0                                 # 耳轴轴心（局部坐标）
+        tip_y = piv_y - (188.0 + lift) - rec           # 炮口：俯仰抬高+后坐
+        for xb in (-30.0, 0.0, 30.0):                  # 左/中/右炮身轴
+            tip_x = xb * 0.55                           # 炮口略微内收
+            # 耳轴座/炮盾
+            p.setPen(QPen(QColor(8, 14, 22), 1))
+            p.setBrush(QColor(42, 58, 76))
+            p.drawRoundedRect(QRectF(xb - 15, piv_y - 16, 30, 34), 6, 6)
+            # 炮尾衬套环
+            p.setBrush(QColor(60, 80, 102))
+            p.drawRoundedRect(QRectF(xb - 10, piv_y - 28, 20, 14), 4, 4)
+            # 液压驻退筒
+            p.setPen(QPen(QColor(18, 28, 40), 2))
+            p.setBrush(QColor(80, 100, 124))
+            p.drawRoundedRect(QRectF(xb - 6, piv_y - 24, 12, 22), 3, 3)
             # 炮身：深色底 + 上表面高光条（金属圆柱感），向纵深变细
-            p.setPen(QPen(QColor(22, 32, 44), 13, Qt.SolidLine, Qt.FlatCap))
-            p.drawLine(QPointF(xb, piv_y - 16), QPointF(tip_x, tip_y + 12))
-            p.setPen(QPen(QColor(26, 36, 50), 10, Qt.SolidLine, Qt.FlatCap))
-            p.drawLine(QPointF(tip_x, tip_y + 12), QPointF(tip_x, tip_y))
-            p.setPen(QPen(QColor(88, 112, 138, 150), 3, Qt.SolidLine,
+            p.setPen(QPen(QColor(26, 38, 52), 14, Qt.SolidLine, Qt.FlatCap))
+            p.drawLine(QPointF(xb, piv_y - 18), QPointF(tip_x, tip_y + 14))
+            p.setPen(QPen(QColor(34, 48, 64), 11, Qt.SolidLine, Qt.FlatCap))
+            p.drawLine(QPointF(tip_x, tip_y + 14), QPointF(tip_x, tip_y + 2))
+            p.setPen(QPen(QColor(100, 126, 156, 180), 3.2, Qt.SolidLine,
                           Qt.FlatCap))
-            p.drawLine(QPointF(xb - 3.6, piv_y - 16),
-                       QPointF(tip_x - 3.6, tip_y + 10))
-            # 炮口箍：加厚段 + 亮端面刻线
-            p.setPen(QPen(QColor(16, 26, 38), 17, Qt.SolidLine, Qt.FlatCap))
-            p.drawLine(QPointF(tip_x, tip_y + 14), QPointF(tip_x, tip_y))
-            p.setPen(QPen(QColor(120, 150, 178, 200), 2))
-            p.drawLine(QPointF(tip_x - 8, tip_y + 2),
-                       QPointF(tip_x + 8, tip_y + 2))
-            if self.muzzle > 0:                           # 炮口焰
+            p.drawLine(QPointF(xb - 4.0, piv_y - 18),
+                       QPointF(tip_x - 4.0, tip_y + 12))
+            # 炮口箍：加厚段 + 亮端面刻线 + 制退器
+            p.setPen(QPen(QColor(18, 30, 44), 18, Qt.SolidLine, Qt.FlatCap))
+            p.drawLine(QPointF(tip_x, tip_y + 16), QPointF(tip_x, tip_y - 2))
+            p.setPen(QPen(QColor(132, 164, 194, 210), 2))
+            p.drawLine(QPointF(tip_x - 9, tip_y + 1),
+                       QPointF(tip_x + 9, tip_y + 1))
+            p.setPen(QPen(QColor(20, 32, 46), 8, Qt.SolidLine, Qt.FlatCap))
+            p.drawLine(QPointF(tip_x, tip_y - 2), QPointF(tip_x, tip_y - 10))
+            if self.muzzle > 0:                         # 炮口焰
                 fr = self.muzzle / 0.22
-                g = QRadialGradient(QPointF(tip_x, tip_y - 6), 34 * fr + 6)
-                g.setColorAt(0, QColor(255, 250, 200, int(255 * fr)))
-                g.setColorAt(0.4, QColor(255, 170, 60, int(200 * fr)))
-                g.setColorAt(1, QColor(255, 100, 20, 0))
+                g = QRadialGradient(QPointF(tip_x, tip_y - 10), 38 * fr + 8)
+                g.setColorAt(0, QColor(255, 255, 220, int(255 * fr)))
+                g.setColorAt(0.25, QColor(255, 210, 80, int(230 * fr)))
+                g.setColorAt(0.55, QColor(255, 130, 40, int(170 * fr)))
+                g.setColorAt(1, QColor(180, 50, 15, 0))
                 p.setPen(QPen(Qt.NoPen))
                 p.setBrush(g)
-                p.drawEllipse(QPointF(tip_x, tip_y - 6), 34 * fr + 6,
-                              30 * fr + 5)
+                p.drawEllipse(QPointF(tip_x, tip_y - 10), 38 * fr + 8,
+                              34 * fr + 7)
+                # 侧向喷焰
+                p.setBrush(QColor(255, 170, 60, int(120 * fr)))
+                p.drawEllipse(QPointF(tip_x, tip_y - 6), 14 * fr + 3, 8 * fr + 2)
         p.restore()
 
     def _paint_reticle(self, p, cx, horizon, f, w, h):

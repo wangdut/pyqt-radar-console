@@ -653,7 +653,10 @@ class Tester(QWidget):
             text = bytes(data).decode("utf-8", "ignore")
             for line in text.splitlines():
                 parts = line.strip().split(",")
-                if len(parts) >= 5 and parts[0] == "OWN":
+                if not parts:
+                    continue
+                cmd = parts[0]
+                if cmd == "OWN" and len(parts) >= 5:
                     try:
                         self.own_x = float(parts[1])
                         self.own_y = float(parts[2])
@@ -662,6 +665,13 @@ class Tester(QWidget):
                         self.last_own_rx = time.time()
                     except ValueError:
                         pass
+                elif cmd == "DEL" and len(parts) >= 2:
+                    # 数据链回传：攻击模块击沉目标后雷达通知测试台同步移除
+                    name = parts[1].strip()
+                    if name in self.targets:
+                        self.targets.pop(name, None)
+                        self._refresh_list()
+                        self._log("ok", "数据链同步：目标 %s 已被击沉，从测试台移除" % name)
 
     def _tick(self):
         online = time.time() - self.last_own_rx < 2.0

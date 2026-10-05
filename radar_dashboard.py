@@ -276,8 +276,15 @@ class RadarScope(QWidget):
             lon, lat = self.region.to_ll(self.own[0], self.own[1])
         msg = "OWN,%.3f,%.3f,%.1f,%.1f,%.6f,%.6f\n" % (
             self.own[0], self.own[1], self.own_hdg, self.own_spd, lat, lon)
-        self.tx.writeDatagram(msg.encode("utf-8"),
-                              QHostAddress.LocalHost, PORT_TX)
+        self._send_cmd(msg)
+
+    def _send_cmd(self, msg):
+        """向测试台发送任意指令（自动补换行）。"""
+        if not isinstance(msg, bytes):
+            msg = msg.encode("utf-8")
+        if not msg.endswith(b"\n"):
+            msg += b"\n"
+        self.tx.writeDatagram(msg, QHostAddress.LocalHost, PORT_TX)
 
     # ---------------- 降生（选择经纬度起点 + 加载真实地图）----------------
     def spawn(self, lat, lon, scale_nm=None):
@@ -1114,7 +1121,9 @@ class Dashboard(QWidget):
             if sc.selected is c:
                 sc.selected = None
             self._atk_states.pop(c.name, None)
-            self._log("info", "目标 %s 已被击沉，从雷达中移除" % c.name)
+            # 数据链回传：通知目标测试台同步删除该目标
+            self.scope._send_cmd("DEL,%s" % c.name)
+            self._log("info", "目标 %s 已被击沉，从雷达与测试台同步移除" % c.name)
         elif state["own_hp"] <= 0:                # 本船战沉：重置该目标交战态
             self._atk_states.pop(c.name, None)
         else:                                      # 撤离：缓存双方血量以便续战
