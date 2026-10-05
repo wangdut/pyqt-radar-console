@@ -8,7 +8,7 @@
 import math
 import random
 
-from PyQt5.QtCore import Qt, QPointF
+from PyQt5.QtCore import Qt, QPointF, QRectF
 from PyQt5.QtGui import QColor, QLinearGradient, QPen, QPolygonF, QRadialGradient
 
 SHIP_LEN = 210.0        # m
