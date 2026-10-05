@@ -1,10 +1,13 @@
 """攻击模块场景 —— 第一人称主炮射击对决。
 
 玩法：鼠标移动调整主炮方位/俯仰（考虑重力下垂，需抬高补偿），
-滚轮缩放瞄准镜，1/2/3 选弹，空格主炮发射，F 发射鱼雷；
-敌舰由 AI 控制蛇形机动并以 ≥15 秒间隔还击（命中率 10~30%）。
-双方血量 1000，鱼雷命中 -400；击沉/战沉后返回战报。
+滚轮缩放瞄准镜，1/2/3 选弹，空格发射当前弹种（主炮一轮齐射 3 发，
+鱼雷无需俯仰直发），F 键随时补射鱼雷；
+W/A/S/D 真实操船（改变本船航速/航向并推进世界坐标）。
 
+本场景与雷达控制台共享一份可变 state（本船/敌舰世界坐标、双方血量）：
+敌舰与雷达目标同一匀速直线规则，每帧按世界坐标重算相对几何，因此
+测距/方位与雷达完全一致；本船操舵会真实写回世界，退出后可在雷达看到。
 对外仅暴露 AttackView（QDialog），通过 battle_closed(str) 信号回传战报。
 """
 
@@ -21,8 +24,13 @@ from . import sfx
 from .ballistics import (KN_TO_MS, drop_meters, drop_moa, time_of_flight,
                          torpedo_time)
 from .enemy import SHIP_LEN, EnemyShip, draw_warship
-from .weapons import (AP_DAMAGE, HE_DAMAGE, HE_NEARMISS, TORP_DAMAGE,
+from .weapons import (AP_DAMAGE, HE_DAMAGE, HE_NEARMISS, SALVO, TORP_DAMAGE,
                       WEAPON_ORDER, WEAPONS)
+
+
+def _norm(a):
+    """角度归一化到 [-π, π]。"""
+    return (a + math.pi) % (2 * math.pi) - math.pi
 
 FONT_HUD = QFont("Consolas", 10)
 FONT_BIG = QFont("Consolas", 16)
@@ -42,9 +50,9 @@ class AttackView(QDialog):
 
     TICK = 1.0 / 30.0
 
-    def __init__(self, own_hdg=0.0, own_spd=0.0, target=None, parent=None):
-        """target: 由雷达控制台传入的真实敌舰 {name,rng,brg,spd,course}；
-        为 None 时退化为随机目标（单测/独立运行）。"""
+    def __init__(self, state=None, parent=None):
+        """state: 与雷达控制台共享的可变战斗状态（本船/敌舰世界坐标+血量）；
+        为 None 时生成一份随机交战状态（单测/独立运行）。"""
         super().__init__(parent)
         self.setWindowTitle("⚔ 主炮对决 —— 攻击模块")
         self.resize(1280, 800)
@@ -54,18 +62,18 @@ class AttackView(QDialog):
         self._last_mouse = None
         self.keys = set()                    # 当前按住的键（WASD 连续操船）
         self._fs_done = False                # 全屏仅首次 show 时强制一次
-        # 本船
-        self.own_hdg, self.own_spd = own_hdg, own_spd
-        self.own_hp = 1000.0
-        self.own_spd_ms = own_spd * KN_TO_MS
-        # 敌舰（优先用雷达真实目标，否则随机）
-        if target is not None:
-            self.enemy = EnemyShip(rng=target.get("rng"), brg=target.get("brg"),
-                                   spd_ms=target.get("spd"),
-                                   course=target.get("course"),
-                                   name=target.get("name"))
-        else:
-            self.enemy = EnemyShip()
+        # 共享可变 state（每帧与退出时写回世界坐标/血量）
+        if state is None:
+            state = self._random_state()
+        self.state = state
+        self.own_world = {"x": state["own_x"], "y": state["own_y"],
+                          "hdg": state["own_hdg"], "spd": state["own_spd"]}
+        self.own_hp = state["own_hp"]
+        self.enemy = EnemyShip(
+            x=state["enemy_x"], y=state["enemy_y"],
+            course=state["enemy_course"], speed=state["enemy_speed"],
+            name=state["enemy_name"], hp=state["enemy_hp"])
+        self._sync_relative()                # 依世界坐标填 enemy.rng/brg
         self.enemy_flash = 0.0               # 敌舰开火炮口闪光计时
         # 瞄准
         self.aim_brg = self.enemy.brg        # rad（相对本船艏向）
@@ -73,7 +81,8 @@ class AttackView(QDialog):
         self.zoom = 6.0
         # 武器
         self.weapon = "ap"
-        self.last_shot = -99.0
+        self.last_shot = -99.0               # 主炮上次齐射时刻
+        self.last_torp = -99.0               # 鱼雷上次发射时刻（与主炮装填独立）
         self.torps = []                      # 鱼雷仿真 {pos,dir,t0}
         self.shots = []                      # 飞行中炮弹 {t_land,aim...}
         self.effects = []                    # 视觉特效
@@ -81,7 +90,7 @@ class AttackView(QDialog):
         self.muzzle = 0.0
         self.hit_flash = 0.0                 # 本船中弹红闪
         self.time0 = time.time()
-        self.over = None                     # None|'win'|'lose'
+        self.over = state.get("over")        # None|'win'|'lose'
         self._log = ["锁定真实目标：%s，方位 %+0.0f°，距离 %.1f km"
                      % (self.enemy.name, math.degrees(self.enemy.brg),
                         self.enemy.rng / 1000)]
@@ -89,6 +98,37 @@ class AttackView(QDialog):
         self.timer.timeout.connect(self._tick)
         self.timer.start(int(self.TICK * 1000))
         self._build_exit()
+
+    @staticmethod
+    def _random_state():
+        """独立运行/单测的兼容退路：构造一份随机交战 state。"""
+        rng_m = random.uniform(5200, 9000)
+        brg = random.uniform(-0.4, 0.4)          # 相对船首方位
+        dist_nm = rng_m / 1852.0
+        return {
+            "own_x": 0.0, "own_y": 0.0, "own_hdg": 0.0, "own_spd": 12.0,
+            "enemy_x": math.sin(brg) * dist_nm, "enemy_y": math.cos(brg) * dist_nm,
+            "enemy_course": random.uniform(0, 360), "enemy_speed": random.uniform(14, 22),
+            "enemy_name": "敌军舰", "own_hp": 1000.0, "enemy_hp": 1000.0,
+            "over": None,
+        }
+
+    def _sync_relative(self):
+        """由世界坐标重算敌舰相对本船的方位/距离（与雷达同一几何）。"""
+        ow, e = self.own_world, self.enemy
+        dx, dy = e.x - ow["x"], e.y - ow["y"]
+        e.rng = max(300.0, math.hypot(dx, dy) * 1852.0)
+        e.brg = _norm(math.atan2(dx, dy) - math.radians(ow["hdg"]))
+
+    def _sync_state(self):
+        """将世界坐标/血量回写到共享 state（供雷达读回与下次续战）。"""
+        s, ow, e = self.state, self.own_world, self.enemy
+        s["own_x"], s["own_y"], s["own_hdg"], s["own_spd"] = (
+            ow["x"], ow["y"], ow["hdg"], ow["spd"])
+        s["enemy_x"], s["enemy_y"] = e.x, e.y
+        s["enemy_course"], s["enemy_speed"], s["enemy_name"] = (
+            e.course, e.speed, e.name)
+        s["own_hp"], s["enemy_hp"], s["over"] = self.own_hp, e.hp, self.over
 
     def showEvent(self, ev):
         """首次显示后强制真全屏：延到事件循环，在 exec_() 弹出后仍生效，
@@ -160,7 +200,7 @@ class AttackView(QDialog):
         elif k == Qt.Key_3:
             self.weapon = "torp"
         elif k == Qt.Key_Space:
-            self._fire_main()
+            self._fire()                      # 空格发射当前选中的武器
         elif k == Qt.Key_F:
             self._fire_torpedo()
         elif k == Qt.Key_Up:
@@ -177,30 +217,34 @@ class AttackView(QDialog):
 
     # ---------------- 本船操舵航向 ----------------
     def _apply_helm(self, dt):
-        """W/S 加减速、A/D 左右舵（与雷达控制台同手感）。
-        本船转向时，敌舰的相对方位/航向同步回转（坐标随船旋转），
-        而炮口方位 aim_brg 相对船体不变——因此转向能真正躲避与创造提前量。"""
-        k = self.keys
-        dh = 0.0
+        """W/S 加减速、A/D 左右舵（与雷达控制台同手感），直接作用于
+        本船世界航向/航速并推进世界坐标；相对敌舰几何由 _sync_relative
+        据此重算——因此操舵是真实机动（写回世界），而非仅特效。"""
+        k, ow = self.keys, self.own_world
         if Qt.Key_A in k:
-            dh -= 25.0 * dt                     # 左舵
+            ow["hdg"] = (ow["hdg"] - 25.0 * dt) % 360.0   # 左舵
         if Qt.Key_D in k:
-            dh += 25.0 * dt                     # 右舵
+            ow["hdg"] = (ow["hdg"] + 25.0 * dt) % 360.0   # 右舵
         if Qt.Key_W in k:
-            self.own_spd = min(40.0, self.own_spd + 8.0 * dt)
+            ow["spd"] = min(40.0, ow["spd"] + 8.0 * dt)
         if Qt.Key_S in k:
-            self.own_spd = max(0.0, self.own_spd - 10.0 * dt)
-        self.own_spd_ms = self.own_spd * KN_TO_MS
-        if dh:
-            self.own_hdg = (self.own_hdg + dh) % 360.0
-            dhr = math.radians(dh)
-            self.enemy.brg -= dhr               # 船右转→目标相对左移
-            self.enemy.course -= dhr
+            ow["spd"] = max(0.0, ow["spd"] - 10.0 * dt)
+        h = math.radians(ow["hdg"])
+        ow["x"] += math.sin(h) * ow["spd"] * dt / 3600.0
+        ow["y"] += math.cos(h) * ow["spd"] * dt / 3600.0
 
     # ---------------- 射击 ----------------
-    def _reload_left(self):
-        w = WEAPONS[self.weapon]
-        return max(0.0, w.reload - (time.time() - self.last_shot))
+    def _reload_left(self, key=None):
+        w = WEAPONS[key or self.weapon]
+        t0 = self.last_torp if w.kind == "torpedo" else self.last_shot
+        return max(0.0, w.reload - (time.time() - t0))
+
+    def _fire(self):
+        """空格统一扳机：按当前弹药分发——主炮齐射，鱼雷直发（无需俯仰）。"""
+        if WEAPONS[self.weapon].kind == "torpedo":
+            self._fire_torpedo()
+        else:
+            self._fire_main()
 
     def _fire_main(self):
         w = WEAPONS[self.weapon]
@@ -212,27 +256,31 @@ class AttackView(QDialog):
             return
         now = time.time()
         tof = time_of_flight(self.enemy.rng, w.speed)
-        self.shots.append({"w": self.weapon, "t0": now, "tof": tof,
-                           "brg": self.aim_brg, "elev": self.aim_elev})
+        for i in range(SALVO):                      # 一轮齐射 SALVO 发，扇形散布
+            off = i - (SALVO - 1) / 2.0             # -1 0 +1：左/中/右三弹可见分离
+            self.shots.append({"w": self.weapon, "t0": now, "tof": tof,
+                               "brg": self.aim_brg + off * 0.0018,
+                               "elev": self.aim_elev + off * 0.0006})
         self.last_shot = now
         self.recoil = 1.0
         self.muzzle = 0.22
         sfx.fire()
-        self._sfx_flash()
+        self._logadd("%s 齐射 ×%d！" % (w.name, SALVO))
 
     def _fire_torpedo(self):
         w = WEAPONS["torp"]
-        if self._reload_left() > 0:
+        if self._reload_left("torp") > 0:           # 鱼雷用自身装填时间，与主炮无关
             return
         if self.enemy.rng > w.rng_max:
-            self._logadd("⚠ 超出鱼雷射程 %.0f m" % w.rng_max)
+            self._logadd("⚠ 超出鱼雷射程 %.0f km" % (w.rng_max / 1000))
             return
         self.torps.append({"fx": 0.0, "sx": 0.0, "dir": self.aim_brg,
                            "t0": time.time()})
-        self.last_shot = time.time()
+        self.last_torp = time.time()
         sfx.torp()
-        self._logadd("鱼雷射出！航速 49 节，预计航行 %.0f 秒"
-                     % torpedo_time(self.enemy.rng, w.speed))
+        self._logadd("鱼雷射出！航速 %.0f 节，预计航行 %.0f 秒"
+                     % (w.speed / KN_TO_MS,
+                        torpedo_time(self.enemy.rng, w.speed)))
 
     def _sfx_flash(self):
         pass
@@ -244,10 +292,13 @@ class AttackView(QDialog):
         if self.over:
             self._effects_update(dt)
             return
-        # 本船操船（WASD）：先更新船速/转向，再推进敌舰相对运动
+        # 本船操船（WASD）：更新航速/航向并推进世界坐标
         self._apply_helm(dt)
-        # 敌舰机动 + 还击
-        fired = self.enemy.update(dt, self.own_spd_ms)
+        # 敌舰按与雷达目标同一规则直线推进，随后重算相对几何
+        self.enemy.integrate(dt)
+        self._sync_relative()
+        # 敌舰还击计时
+        fired = self.enemy.step_fire(dt)
         if fired and self.enemy.hp > 0:
             self.enemy_flash = 0.3
             self._enemy_shoot()
@@ -267,10 +318,13 @@ class AttackView(QDialog):
             self.enemy.sinking = dt
             if self.enemy.sinking > 2.6:
                 self.over = "win"
+                sfx.sink()
         elif self.own_hp <= 0 and self.over is None:
             self.over = "lose"
+            sfx.sink()
         if self.enemy.hp <= 0:
             self.enemy.sinking += dt
+        self._sync_state()
         self.update()
 
     def _enemy_shoot(self):
@@ -329,7 +383,7 @@ class AttackView(QDialog):
         self.effects.append({"type": "hit", "t0": time.time(), "dur": 1.6,
                              "lat": lat_m, "vert": vert_m,
                              "text": "%s 命中 -%d" % (zone, dmg)})
-        sfx.hit()
+        sfx.hit() if dmg < 120 else sfx.explode()   # 重创命中改响爆炸（winsound 单通道不叠加）
         self._logadd("命中 %s！伤害 -%d（敌舰余 %.0f）" % (zone, dmg,
                                                           self.enemy.hp))
 
@@ -355,7 +409,7 @@ class AttackView(QDialog):
                 self.effects.append({"type": "hit", "t0": time.time(),
                                      "dur": 2.4, "lat": 0, "vert": 0,
                                      "text": "鱼雷命中 -400"})
-                sfx.hit()
+                sfx.explode()
                 self._logadd("★ 鱼雷命中敌舰水线！-400（余 %.0f）"
                              % self.enemy.hp)
             elif (time.time() - tp["t0"]) * v > WEAPONS["torp"].rng_max:
@@ -553,9 +607,11 @@ class AttackView(QDialog):
             return
         now = time.time()
         ex, ey, s = self._enemy_screen(cx, horizon, f)
-        tx, ty = ex, ey - 8.0 * s                   # 落点：舰体中部高度
         _, _, x0, y0 = self._gun_geometry(w, h, cx)
         for sh in self.shots:
+            # 每发按自身方位/俯仰散布落点——齐射三发呈可见的三条抛物线
+            tx = ex - (sh["brg"] - self.enemy.brg) * f
+            ty = (ey - 8.0 * s) - (sh["elev"] - self.aim_elev) * f
             k = min(1.0, (now - sh["t0"]) / sh["tof"])
             arc = min(h * 0.40, max(70.0, drop_meters(sh["tof"]) * s * 0.45))
 
@@ -718,13 +774,13 @@ class AttackView(QDialog):
         lines = [
             "敌舰距离  %6.2f km" % (e.rng / 1000),
             "敌舰方位  %+6.1f°   航速 %2.0f 节" % (
-                math.degrees(e.brg), e.spd / KN_TO_MS),
+                math.degrees(e.brg), e.speed),
             "弹丸飞行  %5.1f s    下垂 %5.1f m" % (tof, drop_meters(tof)),
             "需抬高    %5.1f moa   当前 %5.1f" % (
                 drop_moa(e.rng, tof) * 0.001 * RAD_TO_MOA,
                 self.aim_elev * RAD_TO_MOA),
             "本船航速 %3.0f 节  航向 %03.0f°（WASD 操船）" % (
-                self.own_spd, self.own_hdg % 360.0),
+                self.own_world["spd"], self.own_world["hdg"] % 360.0),
         ]
         self._panel(p, 14, 14, 356, 16 + 18 * len(lines))
         for i, s in enumerate(lines):
@@ -777,7 +833,7 @@ class AttackView(QDialog):
         # 操作提示
         p.setPen(QPen(QColor(110, 150, 170, 170), 1))
         p.drawText(QRectF(14, h - 96, 520, 14), Qt.AlignLeft,
-                   "鼠标=瞄准  滚轮=变焦  ↑↓←→=微调  空格=主炮  F=鱼雷  "
+                   "鼠标=瞄准  滚轮=变焦  ↑↓←→=微调  空格=发射当前弹种  F=鱼雷  "
                    "W/S=加减速  A/D=左/右舵  Esc=撤离")
 
     def _panel(self, p, x, y, w, h):
@@ -818,6 +874,7 @@ class AttackView(QDialog):
 
     # ---------------- 退出 ----------------
     def _quit(self):
+        self._sync_state()          # 世界坐标/血量回写共享 state（下次续战/雷达同步）
         if self.over == "win":
             report = "战斗胜利：击沉敌舰，本船损伤 %d%%" % \
                      int((1000 - self.own_hp) / 10)

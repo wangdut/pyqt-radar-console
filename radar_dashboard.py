@@ -834,6 +834,9 @@ class Dashboard(QWidget):
         self.setFocusPolicy(Qt.StrongFocus)
         self._held = set()
         self._clock_blink = False
+        # 攻击战斗持久态（按目标名缓存双方血量，中途撤离再进入可续战）
+        self._atk_states = {}
+        self._atk_view = None            # 战斗中视图（供 _tick_ui 实时回传本船动态）
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 10, 12, 12)
         root.setSpacing(10)
@@ -1063,36 +1066,61 @@ class Dashboard(QWidget):
         sc = self.scope
         if not sc.contacts:
             return None
-        c = sc.selected if (sc.selected in sc.contacts) else \
-            min(sc.contacts, key=lambda t: math.hypot(*sc._rel(t)))
-        dx, dy = sc._rel(c)                       # 东/北，海里
-        own_h = math.radians(sc.own_hdg)
-        norm = lambda a: (a + math.pi) % (2 * math.pi) - math.pi
-        from gunnery.ballistics import KN_TO_MS
-        return {"name": c.name,
-                "rng": math.hypot(dx, dy) * 1852.0,        # 海里→米
-                "brg": norm(math.atan2(dx, dy) - own_h),   # 相对本船艏
-                "spd": c.speed * KN_TO_MS,
-                "course": norm(math.radians(c.heading) - own_h)}
+        if sc.selected in sc.contacts:
+            return sc.selected
+        return min(sc.contacts, key=lambda t: math.hypot(*sc._rel(t)))
 
     def _open_attack(self):
-        """攻击模块入口：将雷达上真实敌舰接入主炮对决场景。
-        gunnery 包自含全部玩法逻辑，与本控制台仅此处一处耦合。"""
+        """攻击模块入口：将雷达上真实敌舰接入主炮对决场景，并打通双向数据链：
+        传入共享世界 state（本船/敌舰坐标与双方血量），战斗期间暂停雷达
+        仿真避免双重复积分，退出后把本船机动写回雷达、目标位置同步、按目标
+        名缓存血量以便下次续战。gunnery 包自含玩法，与本控制台仅此处一处耦合。"""
         from gunnery.attack_view import AttackView
-        target = self._pick_attack_target()
-        if target is None:
+        sc = self.scope
+        c = self._pick_attack_target()
+        if c is None:
             QMessageBox.warning(
                 self, "无可攻击目标",
                 "当前雷达视野内没有敌舰。\n"
                 "请先在目标测试台部署目标（可用鼠标点击选中要攻击的敌舰）。")
             return
-        view = AttackView(own_hdg=self.scope.own_hdg,
-                          own_spd=self.scope.own_spd,
-                          target=target, parent=self)
+        hp = self._atk_states.get(c.name, {"own_hp": 1000.0, "enemy_hp": 1000.0})
+        state = {
+            "own_x": sc.own[0], "own_y": sc.own[1],
+            "own_hdg": sc.own_hdg, "own_spd": sc.own_spd,
+            "enemy_x": c.x, "enemy_y": c.y,
+            "enemy_course": c.heading, "enemy_speed": c.speed,
+            "enemy_name": c.name,
+            "own_hp": hp["own_hp"], "enemy_hp": hp["enemy_hp"], "over": None,
+        }
+        view = AttackView(state=state, parent=self)
         view.battle_closed.connect(
             lambda msg: self._log("info", "【攻击】%s" % msg))
+        was_running = sc.running
+        sc.running = False              # 战斗期间冻结雷达仿真，由攻击场景接管世界
+        self._atk_view = view           # _tick_ui 据此实时回传本船动态到测试台
         self.hide()
         view.exec_()          # 全屏由 AttackView.showEvent 统一保证
+        self._atk_view = None
+        # ---- 双向同步：将战斗结果写回雷达世界 ----
+        sc.own = [state["own_x"], state["own_y"]]
+        sc.own_hdg = state["own_hdg"] % 360.0
+        sc.own_spd = state["own_spd"]
+        if c in sc.contacts:            # 目标随战斗推进的真实位置
+            c.set_motion(state["enemy_x"], state["enemy_y"],
+                         state["enemy_speed"], state["enemy_course"] % 360.0)
+        if state["enemy_hp"] <= 0:                 # 击沉：移除目标、清除缓存
+            sc.contacts = [t for t in sc.contacts if t is not c]
+            if sc.selected is c:
+                sc.selected = None
+            self._atk_states.pop(c.name, None)
+            self._log("info", "目标 %s 已被击沉，从雷达中移除" % c.name)
+        elif state["own_hp"] <= 0:                # 本船战沉：重置该目标交战态
+            self._atk_states.pop(c.name, None)
+        else:                                      # 撤离：缓存双方血量以便续战
+            self._atk_states[c.name] = {
+                "own_hp": state["own_hp"], "enemy_hp": state["enemy_hp"]}
+        sc.running = was_running
         self.show()
 
     def _toggle_run(self):
@@ -1156,6 +1184,15 @@ class Dashboard(QWidget):
         self.lbl_sys.setText("%s 系统正常 · 定位 · 标绘" % led)
 
     def _tick_ui(self):
+        av = self._atk_view
+        if av is not None:
+            # 战斗期间攻击视图接管本船世界坐标：每拍同步回 scope 并继续
+            # 向测试台 4Hz 回报 OWN，使测试台本船图标/航向实时随动而非退出才刷新
+            sc, st = self.scope, av.state
+            sc.own = [st["own_x"], st["own_y"]]
+            sc.own_hdg = st["own_hdg"] % 360.0
+            sc.own_spd = st["own_spd"]
+            sc._send_own()
         self._refresh_list()
         self._refresh_cards()
 

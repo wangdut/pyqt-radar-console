@@ -60,19 +60,34 @@ def _mix(*layers):
 
 
 def _snd_fire():
-    return _mix(_thump(0.55, 42, 0.16), _noise_burst(0.45, 0.09, 3, 0.85))
+    return _mix(_thump(0.85, 46, 0.24, 1.0),
+                _noise_burst(0.6, 0.11, 2, 1.0))
 
 
 def _snd_torp():
-    return _noise_burst(0.5, 0.3, 8, 0.4)          # 沉闷气泡推进声
+    return _noise_burst(0.7, 0.4, 7, 0.6)          # 沉闷气泡发射声
 
 
 def _snd_hit():
-    return _mix(_thump(0.35, 70, 0.10, 0.8), _noise_burst(0.3, 0.06, 2, 0.9))
+    return _mix(_thump(0.4, 90, 0.09, 0.8),
+                _noise_burst(0.28, 0.05, 2, 0.85))
+
+
+def _snd_explode():
+    """大爆炸：雷声般下坠低频 + 大噪声混响（鱼雷/重创命中）。"""
+    return _mix(_thump(1.4, 55, 0.5, 1.0),
+                _thump(1.0, 30, 0.6, 0.8),
+                _noise_burst(1.1, 0.35, 4, 0.95))
+
+
+def _snd_sink():
+    """舰体沉没：延后低频哀鸣 + 水声。"""
+    return _mix(_thump(2.0, 40, 0.9, 0.9),
+                _noise_burst(1.8, 0.6, 6, 0.5))
 
 
 def _snd_splash():
-    return _noise_burst(0.8, 0.25, 6, 0.5)         # 水花
+    return _noise_burst(0.9, 0.3, 5, 0.7)          # 水花
 
 
 def _snd_incoming():
@@ -90,7 +105,8 @@ def _snd_incoming():
 
 
 _SOUNDS = {"fire": _snd_fire, "torp": _snd_torp, "hit": _snd_hit,
-           "splash": _snd_splash, "incoming": _snd_incoming}
+           "explode": _snd_explode, "splash": _snd_splash, "sink": _snd_sink,
+           "incoming": _snd_incoming}
 
 
 def _play(name):
@@ -119,6 +135,14 @@ def hit():
 
 def splash():
     _play("splash")
+
+
+def explode():
+    _play("explode")
+
+
+def sink():
+    _play("sink")
 
 
 def incoming():

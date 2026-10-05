@@ -1,5 +1,6 @@
-"""敌舰 —— 电脑控制的战列舰：蛇形机动 AI、≥15 秒一轮射击、
-10~30% 命中率（距离越近越准），以及精细的侧视军舰建模与分部位命中判定。
+"""敌舰 —— 世界坐标运动的战列舰：与雷达目标同一匀速直线规则、
+≥15 秒一轮还击、10~30% 命中率（距离越近越准），以及精细的侧视军舰
+建模与分部位命中判定。相对本船的方位/距离由攻击场景每帧按本船位姿回写。
 
 纯逻辑 + QPainter 绘制，不依赖雷达控制台。
 """
@@ -10,65 +11,51 @@ import random
 from PyQt5.QtCore import Qt, QPointF
 from PyQt5.QtGui import QColor, QLinearGradient, QPen, QPolygonF
 
-from .ballistics import KN_TO_MS
-
 SHIP_LEN = 210.0        # m
 SHIP_H = 36.0           # m 上层建筑总高（桅顶）
 FREEBOARD = 8.0         # m 干舷
 
 
 class EnemyShip:
-    """相对本船极坐标运动模型：brg=相对本船艏向方位(rad)，rng=距离(m)。"""
+    """世界坐标敌舰：位置(海里)/真航向(度)/航速(节)，与雷达控制台
+    Contact 同一运动规则（匀速直线）；相对本船的方位/距离由场景
+    每帧回写，保证与雷达测得的几何完全一致。"""
 
-    def __init__(self, rng=None, brg=None, spd_ms=None, course=None, name=None):
-        """不传参则随机生成（单测/独立运行）；传入真实目标数据
-        时与雷达控制台部署的敌舰对上号。"""
+    def __init__(self, x=0.0, y=0.0, course=0.0, speed=0.0, name=None,
+                 hp=1000.0, rng=6000.0, brg=0.0):
+        self.x = float(x)                 # 世界坐标（海里，东/北）
+        self.y = float(y)
+        self.course = float(course)       # 真航向（度）
+        self.speed = float(speed)         # 航速（节）
         self.name = name or "敌军舰"
-        self.hp = 1000.0
-        self.rng = rng if rng is not None else random.uniform(5200, 9000)
-        self.rng = max(300.0, float(self.rng))        # 避免零距离/除零
-        self.brg = brg if brg is not None else random.uniform(-0.5, 0.5)  # rad，相对本船船首
-        self.spd = spd_ms if spd_ms is not None else random.uniform(15, 22) * KN_TO_MS
-        self.course = course if course is not None else random.uniform(0, math.tau)  # 相对本船艏向
-        self._course_t = random.uniform(6, 14)        # 蛇形：转向决策计时
+        self.hp = max(0.0, float(hp))     # 血量（由持久化 state 注入）
+        # 相对本船（场景每帧回写，仅供绘制/命中/测距使用）
+        self.rng = max(300.0, float(rng))
+        self.brg = float(brg)
         self._next_fire = random.uniform(15.0, 18.0)  # 首发也遵守≥15秒
         self.alive = True
-        self.sinking = 0.0                            # 沉没动画进度
+        self.sinking = 0.0                # 沉没动画进度
 
-    # ---------------- AI ----------------
-    def hit_rate(self):
-        """命中率：12km→10%，3km→30%，线性内插并夹取。"""
-        r = (12000.0 - self.rng) / (12000.0 - 3000.0)
-        return min(0.30, max(0.10, 0.10 + 0.20 * r))
+    # ---------------- 运动 / 开火 ----------------
+    def integrate(self, dt):
+        """按当前航向/航速直线推进（与雷达目标一致）。"""
+        h = math.radians(self.course)
+        self.x += math.sin(h) * self.speed * dt / 3600.0
+        self.y += math.cos(h) * self.speed * dt / 3600.0
 
-    def update(self, dt, own_spd_ms):
-        """推进机动；返回本次是否开火 (fired:bool)。"""
-        self._course_t -= dt
-        if self._course_t <= 0:                        # 蛇形机动：随机改向
-            self._course_t = random.uniform(5, 12)
-            base = self._drift_base()
-            self.course = base + random.uniform(-0.9, 0.9)
-            self.spd = random.uniform(14, 24) * KN_TO_MS
-        # 相对速度 = 敌速矢量 - 本船前进矢量（本船恒沿船首方向）
-        vx = math.sin(self.course) * self.spd
-        vy = math.cos(self.course) * self.spd - own_spd_ms
-        fx = self.rng * math.cos(self.brg) + vy * dt   # 向前分量
-        sx = self.rng * math.sin(self.brg) + vx * dt   # 向右分量
-        self.rng = math.hypot(fx, sx)
-        self.brg = math.atan2(sx, fx)
+    def step_fire(self, dt):
+        """还击计时（≥15 秒一轮）；返回本帧是否开火。"""
         self._next_fire -= dt
         if self._next_fire <= 0:
-            self._next_fire = random.uniform(15.0, 24.0)  # 最快 15 秒一轮
+            self._next_fire = random.uniform(15.0, 24.0)
             return True
         return False
 
-    def _drift_base(self):
-        """期望机动基向：远则接近、过近则拉开、否则横切。"""
-        if self.rng > 7500:
-            return math.atan2(-math.sin(self.brg), -math.cos(self.brg))
-        if self.rng < 2600:
-            return math.atan2(math.sin(self.brg), math.cos(self.brg))
-        return self.brg + math.copysign(math.pi / 2, self.brg or 1)
+    # ---------------- AI ----------------
+    def hit_rate(self):
+        """命中率：12km→10%，3km→30%，线性内插并夹取（基于相对距离）。"""
+        r = (12000.0 - self.rng) / (12000.0 - 3000.0)
+        return min(0.30, max(0.10, 0.10 + 0.20 * r))
 
     # ---------------- 命中判定 ----------------
     @staticmethod

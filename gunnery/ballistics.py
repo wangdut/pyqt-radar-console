@@ -11,7 +11,7 @@ import math
 from .weapons import G
 
 DRAG_FACTOR = 1.0        # 平均速度/初速：大口径远射程舰炮万米内衰减很小
-DROP_SCALE = 0.22        # 平直弹道下垂系数（6km 约需抬高 40moa，可目视校射）
+DROP_SCALE = 0.11        # 平直弹道下垂系数（再降至旧值 50%，6km 仅需抬高 ≈20moa）
 KN_TO_MS = 0.514444      # 节 -> m/s
 
 
