@@ -1040,6 +1040,17 @@ class Dashboard(QWidget):
             lambda v: setattr(self.scope, "guard_nm", float(v)))
         lay.addWidget(self.spn_guard)
 
+        self.btn_attack = QPushButton("⚔ 攻击")
+        self.btn_attack.setCursor(Qt.PointingHandCursor)
+        self.btn_attack.setToolTip("进入主炮对决：瞄准敌舰，穿甲/高爆/鱼雷打击")
+        self.btn_attack.setStyleSheet(
+            "QPushButton{background:#3a1216;color:#ffd7d7;"
+            "border:1px solid #8a2c34;border-radius:4px;"
+            "padding:5px 16px;font-weight:bold;}"
+            "QPushButton:hover{background:#57191f;border-color:#c0393f;}")
+        self.btn_attack.clicked.connect(self._open_attack)
+        lay.addWidget(self.btn_attack)
+
         lay.addStretch(1)
         help_lbl = QLabel("操纵：↑/W 加速 · ↓/S 减速 · A 左舵 · D 右舵")
         help_lbl.setObjectName("SubTitle")
@@ -1047,6 +1058,19 @@ class Dashboard(QWidget):
         return bar
 
     # ---------- 槽函数 ----------
+    def _open_attack(self):
+        """攻击模块入口：切换到主炮对决场景。
+        gunnery 包自含全部玩法逻辑，与本控制台仅此处一处耦合。"""
+        from gunnery.attack_view import AttackView
+        view = AttackView(own_hdg=self.scope.own_hdg,
+                          own_spd=self.scope.own_spd, parent=self)
+        view.battle_closed.connect(
+            lambda msg: self._log("info", "【攻击】%s" % msg))
+        self.hide()
+        view.showFullScreen()          # 直接进入全屏炮战视野
+        view.exec_()
+        self.show()
+
     def _toggle_run(self):
         self.scope.running = not self.scope.running
         self.btn_run.setText("▶ 恢复扫描" if not self.scope.running else "⏸ 暂停扫描")
