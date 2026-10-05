@@ -18,9 +18,9 @@ from PyQt5.QtGui import (QColor, QFont, QPainter, QPainterPath, QPen,
 from PyQt5.QtNetwork import QHostAddress, QUdpSocket
 from PyQt5.QtWidgets import (QApplication, QComboBox, QDoubleSpinBox, QFrame,
                              QGridLayout, QHBoxLayout, QLabel, QListWidget,
-                             QListWidgetItem, QPlainTextEdit, QPushButton,
-                             QSizePolicy, QSlider, QSplitter, QVBoxLayout,
-                             QWidget)
+                             QListWidgetItem, QMessageBox, QPlainTextEdit,
+                             QPushButton, QSizePolicy, QSlider, QSplitter,
+                             QVBoxLayout, QWidget)
 
 import nr_data
 import osm_client
@@ -1058,17 +1058,41 @@ class Dashboard(QWidget):
         return bar
 
     # ---------- 槽函数 ----------
+    def _pick_attack_target(self):
+        """选攻击目标：优先鼠标选中的目标，否则取最近的一个；无目标返回 None。"""
+        sc = self.scope
+        if not sc.contacts:
+            return None
+        c = sc.selected if (sc.selected in sc.contacts) else \
+            min(sc.contacts, key=lambda t: math.hypot(*sc._rel(t)))
+        dx, dy = sc._rel(c)                       # 东/北，海里
+        own_h = math.radians(sc.own_hdg)
+        norm = lambda a: (a + math.pi) % (2 * math.pi) - math.pi
+        from gunnery.ballistics import KN_TO_MS
+        return {"name": c.name,
+                "rng": math.hypot(dx, dy) * 1852.0,        # 海里→米
+                "brg": norm(math.atan2(dx, dy) - own_h),   # 相对本船艏
+                "spd": c.speed * KN_TO_MS,
+                "course": norm(math.radians(c.heading) - own_h)}
+
     def _open_attack(self):
-        """攻击模块入口：切换到主炮对决场景。
+        """攻击模块入口：将雷达上真实敌舰接入主炮对决场景。
         gunnery 包自含全部玩法逻辑，与本控制台仅此处一处耦合。"""
         from gunnery.attack_view import AttackView
+        target = self._pick_attack_target()
+        if target is None:
+            QMessageBox.warning(
+                self, "无可攻击目标",
+                "当前雷达视野内没有敌舰。\n"
+                "请先在目标测试台部署目标（可用鼠标点击选中要攻击的敌舰）。")
+            return
         view = AttackView(own_hdg=self.scope.own_hdg,
-                          own_spd=self.scope.own_spd, parent=self)
+                          own_spd=self.scope.own_spd,
+                          target=target, parent=self)
         view.battle_closed.connect(
             lambda msg: self._log("info", "【攻击】%s" % msg))
         self.hide()
-        view.showFullScreen()          # 直接进入全屏炮战视野
-        view.exec_()
+        view.exec_()          # 全屏由 AttackView.showEvent 统一保证
         self.show()
 
     def _toggle_run(self):

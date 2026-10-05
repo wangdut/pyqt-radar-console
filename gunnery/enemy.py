@@ -20,12 +20,16 @@ FREEBOARD = 8.0         # m 干舷
 class EnemyShip:
     """相对本船极坐标运动模型：brg=相对本船艏向方位(rad)，rng=距离(m)。"""
 
-    def __init__(self, rng=None):
+    def __init__(self, rng=None, brg=None, spd_ms=None, course=None, name=None):
+        """不传参则随机生成（单测/独立运行）；传入真实目标数据
+        时与雷达控制台部署的敌舰对上号。"""
+        self.name = name or "敌军舰"
         self.hp = 1000.0
         self.rng = rng if rng is not None else random.uniform(5200, 9000)
-        self.brg = random.uniform(-0.5, 0.5)          # rad，相对本船船首
-        self.spd = random.uniform(15, 22) * KN_TO_MS  # m/s
-        self.course = random.uniform(0, math.tau)     # 相对本船艏向的航向
+        self.rng = max(300.0, float(self.rng))        # 避免零距离/除零
+        self.brg = brg if brg is not None else random.uniform(-0.5, 0.5)  # rad，相对本船船首
+        self.spd = spd_ms if spd_ms is not None else random.uniform(15, 22) * KN_TO_MS
+        self.course = course if course is not None else random.uniform(0, math.tau)  # 相对本船艏向
         self._course_t = random.uniform(6, 14)        # 蛇形：转向决策计时
         self._next_fire = random.uniform(15.0, 18.0)  # 首发也遵守≥15秒
         self.alive = True

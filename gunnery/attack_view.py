@@ -42,7 +42,9 @@ class AttackView(QDialog):
 
     TICK = 1.0 / 30.0
 
-    def __init__(self, own_hdg=0.0, own_spd=0.0, parent=None):
+    def __init__(self, own_hdg=0.0, own_spd=0.0, target=None, parent=None):
+        """target: 由雷达控制台传入的真实敌舰 {name,rng,brg,spd,course}；
+        为 None 时退化为随机目标（单测/独立运行）。"""
         super().__init__(parent)
         self.setWindowTitle("⚔ 主炮对决 —— 攻击模块")
         self.resize(1280, 800)
@@ -50,12 +52,20 @@ class AttackView(QDialog):
         self.setCursor(Qt.BlankCursor)         # 炮战视野不需要鼠标指针/点击
         self.setStyleSheet("background:#04080e;")
         self._last_mouse = None
+        self.keys = set()                    # 当前按住的键（WASD 连续操船）
+        self._fs_done = False                # 全屏仅首次 show 时强制一次
         # 本船
         self.own_hdg, self.own_spd = own_hdg, own_spd
         self.own_hp = 1000.0
         self.own_spd_ms = own_spd * KN_TO_MS
-        # 敌舰
-        self.enemy = EnemyShip()
+        # 敌舰（优先用雷达真实目标，否则随机）
+        if target is not None:
+            self.enemy = EnemyShip(rng=target.get("rng"), brg=target.get("brg"),
+                                   spd_ms=target.get("spd"),
+                                   course=target.get("course"),
+                                   name=target.get("name"))
+        else:
+            self.enemy = EnemyShip()
         self.enemy_flash = 0.0               # 敌舰开火炮口闪光计时
         # 瞄准
         self.aim_brg = self.enemy.brg        # rad（相对本船艏向）
@@ -72,12 +82,21 @@ class AttackView(QDialog):
         self.hit_flash = 0.0                 # 本船中弹红闪
         self.time0 = time.time()
         self.over = None                     # None|'win'|'lose'
-        self._log = ["敌舰出现，方位 %+0.0f°，距离 %.1f km"
-                     % (math.degrees(self.enemy.brg), self.enemy.rng / 1000)]
+        self._log = ["锁定真实目标：%s，方位 %+0.0f°，距离 %.1f km"
+                     % (self.enemy.name, math.degrees(self.enemy.brg),
+                        self.enemy.rng / 1000)]
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
         self.timer.start(int(self.TICK * 1000))
         self._build_exit()
+
+    def showEvent(self, ev):
+        """首次显示后强制真全屏：延到事件循环，在 exec_() 弹出后仍生效，
+        盖住 Windows 任务栏。"""
+        super().showEvent(ev)
+        if not self._fs_done:
+            self._fs_done = True
+            QTimer.singleShot(0, self.showFullScreen)
 
     # ---------------- UI 辅助 ----------------
     def _build_exit(self):
@@ -126,6 +145,7 @@ class AttackView(QDialog):
 
     def keyPressEvent(self, ev):
         k = ev.key()
+        self.keys.add(k)                       # WASD 连续操船靠此集合驱动
         if k == Qt.Key_Escape:
             self._quit()
             return
@@ -151,6 +171,31 @@ class AttackView(QDialog):
             self.aim_brg -= 0.0006
         elif k == Qt.Key_Right:
             self.aim_brg += 0.0006
+
+    def keyReleaseEvent(self, ev):
+        self.keys.discard(ev.key())
+
+    # ---------------- 本船操舵航向 ----------------
+    def _apply_helm(self, dt):
+        """W/S 加减速、A/D 左右舵（与雷达控制台同手感）。
+        本船转向时，敌舰的相对方位/航向同步回转（坐标随船旋转），
+        而炮口方位 aim_brg 相对船体不变——因此转向能真正躲避与创造提前量。"""
+        k = self.keys
+        dh = 0.0
+        if Qt.Key_A in k:
+            dh -= 25.0 * dt                     # 左舵
+        if Qt.Key_D in k:
+            dh += 25.0 * dt                     # 右舵
+        if Qt.Key_W in k:
+            self.own_spd = min(40.0, self.own_spd + 8.0 * dt)
+        if Qt.Key_S in k:
+            self.own_spd = max(0.0, self.own_spd - 10.0 * dt)
+        self.own_spd_ms = self.own_spd * KN_TO_MS
+        if dh:
+            self.own_hdg = (self.own_hdg + dh) % 360.0
+            dhr = math.radians(dh)
+            self.enemy.brg -= dhr               # 船右转→目标相对左移
+            self.enemy.course -= dhr
 
     # ---------------- 射击 ----------------
     def _reload_left(self):
@@ -199,6 +244,8 @@ class AttackView(QDialog):
         if self.over:
             self._effects_update(dt)
             return
+        # 本船操船（WASD）：先更新船速/转向，再推进敌舰相对运动
+        self._apply_helm(dt)
         # 敌舰机动 + 还击
         fired = self.enemy.update(dt, self.own_spd_ms)
         if fired and self.enemy.hp > 0:
@@ -654,7 +701,8 @@ class AttackView(QDialog):
                 p.setFont(t)
                 p.setPen(QPen(QColor(255, 90, 90, 230), 1))
                 p.drawText(QRectF(ex + box + 6, ey - box * 0.2 - 8,
-                                  70, 16), Qt.AlignLeft, "◤ LOCK")
+                                  160, 16), Qt.AlignLeft,
+                           "◤ LOCK %s" % self.enemy.name)
 
     def _paint_hud(self, p, w, h):
         e = self.enemy
@@ -675,12 +723,13 @@ class AttackView(QDialog):
             "需抬高    %5.1f moa   当前 %5.1f" % (
                 drop_moa(e.rng, tof) * 0.001 * RAD_TO_MOA,
                 self.aim_elev * RAD_TO_MOA),
-            "本船航速  %2.0f 节（影响目标相对运动）" % self.own_spd,
+            "本船航速 %3.0f 节  航向 %03.0f°（WASD 操船）" % (
+                self.own_spd, self.own_hdg % 360.0),
         ]
-        self._panel(p, 14, 14, 300, 16 + 18 * len(lines))
+        self._panel(p, 14, 14, 356, 16 + 18 * len(lines))
         for i, s in enumerate(lines):
             p.setPen(QPen(QColor(140, 235, 255, 220), 1))
-            p.drawText(QRectF(26, 20 + i * 18, 280, 16), Qt.AlignLeft, s)
+            p.drawText(QRectF(26, 20 + i * 18, 336, 16), Qt.AlignLeft, s)
         # 右上：弹药面板
         x0 = w - 254
         self._panel(p, x0, 14, 240, 118)
@@ -727,8 +776,9 @@ class AttackView(QDialog):
                               546, 14), Qt.AlignRight, s)
         # 操作提示
         p.setPen(QPen(QColor(110, 150, 170, 170), 1))
-        p.drawText(QRectF(14, h - 96, 420, 14), Qt.AlignLeft,
-                   "鼠标=瞄准  滚轮=变焦  ↑↓←→=微调  空格=主炮  F=鱼雷  Esc=撤离")
+        p.drawText(QRectF(14, h - 96, 520, 14), Qt.AlignLeft,
+                   "鼠标=瞄准  滚轮=变焦  ↑↓←→=微调  空格=主炮  F=鱼雷  "
+                   "W/S=加减速  A/D=左/右舵  Esc=撤离")
 
     def _panel(self, p, x, y, w, h):
         p.setPen(QPen(QColor(0, 255, 160, 60), 1))
