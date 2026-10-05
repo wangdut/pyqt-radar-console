@@ -88,7 +88,9 @@ class AttackView(QDialog):
         self.effects = []                    # 视觉特效
         self.recoil = 0.0
         self.muzzle = 0.0
-        self.hit_flash = 0.0                 # 本船中弹红闪
+        self.shake = 0.0                   # 中弹/爆炸屏幕震动强度（0~1）
+        self.over_t = 0.0                  # 战斗结束后经过时间（自动返回倒计时）
+        self.hit_flash = 0.0               # 本船中弹红闪
         self.time0 = time.time()
         self.over = state.get("over")        # None|'win'|'lose'
         self._log = ["锁定真实目标：%s，方位 %+0.0f°，距离 %.1f km"
@@ -97,6 +99,7 @@ class AttackView(QDialog):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
         self.timer.start(int(self.TICK * 1000))
+        self._closed = False               # 防止自动退出与手动退出重复触发
         self._build_exit()
 
     @staticmethod
@@ -274,8 +277,13 @@ class AttackView(QDialog):
         if self.enemy.rng > w.rng_max:
             self._logadd("⚠ 超出鱼雷射程 %.0f km" % (w.rng_max / 1000))
             return
-        self.torps.append({"fx": 0.0, "sx": 0.0, "dir": self.aim_brg,
-                           "t0": time.time()})
+        # 以发射瞬间的绝对方位角（本船航向+瞄准相对方位）在世界系惯性直行，
+        # 之后本船操舵不影响已发出的鱼雷
+        crs = math.radians(self.own_world["hdg"]) + self.aim_brg
+        self.torps.append({"x": self.own_world["x"] * 1852.0,
+                           "y": self.own_world["y"] * 1852.0,
+                           "vx": math.sin(crs) * w.speed,
+                           "vy": math.cos(crs) * w.speed, "d": 0.0})
         self.last_torp = time.time()
         sfx.torp()
         self._logadd("鱼雷射出！航速 %.0f 节，预计航行 %.0f 秒"
@@ -289,8 +297,18 @@ class AttackView(QDialog):
     def _tick(self):
         now = time.time()
         dt = self.TICK
+        self.shake = max(0.0, self.shake - dt * 2.2)
+        self.hit_flash = max(0.0, self.hit_flash - dt * 1.6)
         if self.over:
+            # 战斗结束：爆炸/沉没动画继续，3.5 秒后自动返回雷达控制台
             self._effects_update(dt)
+            if self.enemy.hp <= 0:
+                self.enemy.sinking += dt
+            self.over_t += dt
+            if self.over_t >= 3.5:
+                self._quit()
+                return
+            self.update()
             return
         # 本船操船（WASD）：更新航速/航向并推进世界坐标
         self._apply_helm(dt)
@@ -312,18 +330,18 @@ class AttackView(QDialog):
         self.recoil = max(0.0, self.recoil - dt * 4)
         self.muzzle = max(0.0, self.muzzle - dt)
         self.enemy_flash = max(0.0, self.enemy_flash - dt)
-        self.hit_flash = max(0.0, self.hit_flash - dt * 1.6)
-        # 胜负
-        if self.enemy.hp <= 0 and self.over is None:
-            self.enemy.sinking = dt
-            if self.enemy.sinking > 2.6:
+        # 胜负：敌舰血量归零→沉没动画满 2.6s 后判胜；本船归零判负
+        # （旧 bug：sinking 被每帧赋值重置，永远达不到阈值，导致无法胜利返回）
+        if self.enemy.hp <= 0:
+            self.enemy.sinking += dt
+            if self.over is None and self.enemy.sinking > 2.6:
                 self.over = "win"
+                self.over_t = 0.0
                 sfx.sink()
         elif self.own_hp <= 0 and self.over is None:
             self.over = "lose"
+            self.over_t = 0.0
             sfx.sink()
-        if self.enemy.hp <= 0:
-            self.enemy.sinking += dt
         self._sync_state()
         self.update()
 
@@ -345,7 +363,16 @@ class AttackView(QDialog):
             dmg = random.uniform(60, 100)
         self.own_hp = max(0.0, self.own_hp - dmg)
         self.hit_flash = 1.0
-        sfx.hit()
+        self.shake = min(1.0, 0.3 + dmg / 90.0)     # 中弹震动与伤害成正比
+        # 本船舷侧起火爆炸特效（屏幕空间位置，重创更大更响）
+        self.effects.append({"type": "own_hit", "t0": time.time(),
+                             "dur": 1.5, "fx": random.uniform(-0.30, 0.30),
+                             "fy": random.uniform(0.76, 0.93),
+                             "big": dmg >= 60})
+        if dmg >= 60:
+            sfx.explode()
+        else:
+            sfx.hit()
         self._logadd("⚠ 被敌弹命中！本船损伤 -%d（余 %.0f）" % (dmg,
                                                                 self.own_hp))
 
@@ -396,23 +423,26 @@ class AttackView(QDialog):
         sfx.splash()
 
     def _torp_step(self, dt):
+        """鱼雷世界坐标直线推进；命中判定用与敌舰的世界距离。"""
         v = WEAPONS["torp"].speed
-        ex = self.enemy.rng * math.sin(self.enemy.brg)
-        ez = self.enemy.rng * math.cos(self.enemy.brg)
+        e = self.enemy
+        ex, ey = e.x * 1852.0, e.y * 1852.0
         for tp in list(self.torps):
-            tp["sx"] += math.sin(tp["dir"]) * v * dt
-            tp["fx"] += math.cos(tp["dir"]) * v * dt
-            d = math.hypot(tp["sx"] - ex, tp["fx"] - ez)
-            if d < 55.0:
+            tp["x"] += tp["vx"] * dt
+            tp["y"] += tp["vy"] * dt
+            tp["d"] += v * dt
+            if math.hypot(tp["x"] - ex, tp["y"] - ey) < 55.0:
                 self.torps.remove(tp)
                 self.enemy.hp = max(0.0, self.enemy.hp - TORP_DAMAGE)
-                self.effects.append({"type": "hit", "t0": time.time(),
-                                     "dur": 2.4, "lat": 0, "vert": 0,
+                self.effects.append({"type": "torp_explosion",
+                                     "t0": time.time(), "dur": 2.4,
+                                     "lat": 0, "vert": 0,
                                      "text": "鱼雷命中 -400"})
+                self.shake = max(self.shake, 0.35)   # 爆炸震动传及本船
                 sfx.explode()
                 self._logadd("★ 鱼雷命中敌舰水线！-400（余 %.0f）"
                              % self.enemy.hp)
-            elif (time.time() - tp["t0"]) * v > WEAPONS["torp"].rng_max:
+            elif tp["d"] > WEAPONS["torp"].rng_max:
                 self.torps.remove(tp)
                 self._logadd("鱼雷航程耗尽，未命中")
 
@@ -435,6 +465,9 @@ class AttackView(QDialog):
     def paintEvent(self, ev):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
+        if self.shake > 0:                  # 中弹震动：短暂随机平移整个画面
+            p.translate(random.uniform(-9, 9) * self.shake,
+                        random.uniform(-7, 7) * self.shake)
         w, h = self.width(), self.height()
         f = self._focus_f()
         cx, horizon = w / 2.0, h * 0.52
@@ -449,8 +482,9 @@ class AttackView(QDialog):
         self._paint_reticle(p, cx, horizon, f, w, h)
         self._paint_hud(p, w, h)
         if self.hit_flash > 0:
-            p.fillRect(self.rect(), QColor(255, 40, 30, int(70 *
-                                                           self.hit_flash)))
+            p.fillRect(self.rect().adjusted(-20, -20, 20, 20),
+                       QColor(255, 40, 30, int(140 * min(1.0,
+                                                          self.hit_flash))))
         if self.over:
             self._paint_over(p, w, h)
         p.end()
@@ -513,12 +547,15 @@ class AttackView(QDialog):
                           14 * s + 4, 14 * s + 4)
 
     def _paint_torps(self, p, cx, horizon, f, w, h):
-        """鱼雷航迹：从屏幕底部向目标航行的白色航迹点。"""
-        v = WEAPONS["torp"].speed
+        """鱼雷航迹：世界系惯性直线换算为相对本船方位后绘制，
+        本船转向时已发出的鱼雷保持自己的航迹而不跟着扫。"""
+        ow = self.own_world
+        ox, oy = ow["x"] * 1852.0, ow["y"] * 1852.0
+        hd = math.radians(ow["hdg"])
         for tp in self.torps:
-            dist = math.hypot(tp["fx"], tp["sx"])
-            k = min(1.0, dist / 4000.0)
-            x = cx + (tp["dir"] - self.aim_brg) * f * (1 - k * 0.55)
+            rel = _norm(math.atan2(tp["x"] - ox, tp["y"] - oy) - hd)
+            k = min(1.0, tp["d"] / 4000.0)
+            x = cx + (rel - self.aim_brg) * f * (1 - k * 0.55)
             y = h - (h - horizon) * k * 0.92
             p.setPen(QPen(QColor(200, 230, 255, 130), 1))
             p.drawLine(QPointF(x, y + 16), QPointF(x, y))
@@ -541,18 +578,27 @@ class AttackView(QDialog):
                                        10 + 26 * k, QColor(190, 225, 245),
                                        1.0 - k)
                 else:
-                    g = QRadialGradient(QPointF(px, py), 30 + 40 * k)
-                    g.setColorAt(0, QColor(255, 220, 120, int(220 * (1 - k))))
-                    g.setColorAt(0.5, QColor(255, 90, 30, int(140 * (1 - k))))
-                    g.setColorAt(1, QColor(60, 30, 20, 0))
-                    p.setPen(QPen(Qt.NoPen))
-                    p.setBrush(g)
-                    p.drawEllipse(QPointF(px, py), 30 + 40 * k,
-                                  (30 + 40 * k) * 0.8)
+                    self._explosion(p, px, py, k, scale=1.0)
                 if e.get("text"):
                     self._popup(p, px, py - 34 - 26 * k, e["text"],
                                 QColor(255, 120, 90) if e["type"] == "hit"
                                 else QColor(150, 200, 220), 1.0 - k)
+            elif e["type"] == "torp_explosion":     # 鱼雷命中：巨型爆炸
+                px = ex
+                py = ey - 6 * s
+                sc = max(1.2, min(3.2, 10000.0 / max(self.enemy.rng, 800.0)))
+                self._explosion(p, px, py, k, scale=sc * 1.4)
+                self._water_column(p, px, min(py, ey + 60),
+                                   (40 + 90 * k) * sc, QColor(215, 238, 250),
+                                   1.0 - k)
+                if e.get("text"):
+                    self._popup(p, px, py - 70 * sc - 30 * k, e["text"],
+                                QColor(255, 170, 80), 1.0 - k)
+            elif e["type"] == "own_hit":           # 本船中弹：舷侧火光
+                px = cx + e["fx"] * w
+                py = e["fy"] * h
+                self._explosion(p, px, py, k,
+                                scale=2.3 if e["big"] else 1.4)
             elif e["type"] == "incoming":          # 来袭弹：由远及近的白点
                 px = ex + (cx - ex) * k * k
                 py = ey + (h * 0.86 - ey) * k * k
@@ -564,6 +610,35 @@ class AttackView(QDialog):
                 self._water_column(p, w * 0.5 + math.sin(e["t0"]) * w * 0.3,
                                    h * 0.8, 26 + 50 * k,
                                    QColor(200, 230, 250), 1.0 - k)
+
+    def _explosion(self, p, x, y, k, scale=1.0):
+        """通用分层爆炸：冲击波圈（快速扩散消失）→ 白核橙边火球 →
+        上升消停黑烟。k 为 0~1 进度，scale 控制尺寸。"""
+        p.setPen(QPen(Qt.NoPen))
+        if k < 0.5:                             # 冲击波圈
+            rr = (16 + 110 * k) * scale
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(QColor(255, 240, 200, int(190 * (1 - k / 0.5))), 2))
+            p.drawEllipse(QPointF(x, y), rr, rr * 0.6)
+        if k < 0.6:                             # 火球阶段
+            kf = k / 0.6
+            r = (30 + 62 * kf) * scale
+            g = QRadialGradient(QPointF(x, y), r)
+            g.setColorAt(0, QColor(255, 255, 230, int(255 * (1 - kf))))
+            g.setColorAt(0.4, QColor(255, 185, 70, int(235 * (1 - kf))))
+            g.setColorAt(0.75, QColor(230, 80, 30, int(170 * (1 - kf))))
+            g.setColorAt(1, QColor(80, 30, 15, 0))
+            p.setPen(QPen(Qt.NoPen))
+            p.setBrush(g)
+            p.drawEllipse(QPointF(x, y), r, r * 0.85)
+        ks = min(1.0, k / 0.9)                  # 浓烟滞留上升
+        r2 = (22 + 86 * k) * scale
+        g2 = QRadialGradient(QPointF(x, y - 26 * scale * ks), r2)
+        g2.setColorAt(0, QColor(46, 40, 36, int(160 * (1 - ks))))
+        g2.setColorAt(1, QColor(26, 22, 20, 0))
+        p.setPen(QPen(Qt.NoPen))
+        p.setBrush(g2)
+        p.drawEllipse(QPointF(x, y - 26 * scale * ks), r2, r2 * 0.78)
 
     def _water_column(self, p, x, y, hgt, col, alpha):
         a = max(0, int(200 * alpha))
@@ -597,8 +672,8 @@ class AttackView(QDialog):
         返回 (az_deg, lift, 炮口屏幕坐标) 供绘制与弹丸起点共用。"""
         az_deg = max(-38.0, min(38.0, math.degrees(self.aim_brg) * 2.4))
         lift = min(90.0, self.aim_elev * 1200.0)
-        mz_x = cx + math.sin(math.radians(az_deg)) * 210.0
-        mz_y = h - 26 - 56 - 150.0 - lift
+        mz_x = cx + math.sin(math.radians(az_deg)) * 230.0
+        mz_y = h - 26 - 250.0 - lift
         return az_deg, lift, mz_x, mz_y
 
     def _paint_shots(self, p, cx, horizon, f, w, h):
@@ -635,39 +710,97 @@ class AttackView(QDialog):
             p.drawEllipse(QPointF(px_, py_), 8, 8)
 
     def _paint_gun(self, p, w, h, cx):
-        """屏幕下方本船主炮剪影：方位→炮管整体左右旋转（直观显示
-        朝向），俯仰→炮口上抬（限幅），另然后坐/炮口焰。"""
+        """屏幕下方本船主炮剪影：炮座转盘环 + 梯形缩厚装甲炮塔
+        （金属渐变/顶盖/测距仪鼓包/装甲缝高光）+ 双炮身（耳轴座、
+        炮尾衬套、变细炮身带高光、炮口箍）；方位→炮塔前整体左右
+        旋转，俯仰→炮口上抬（限幅），另然后坐/炮口焰。"""
         base_y = h - 26
-        tower_w = 190
-        p.setPen(QPen(QColor(12, 18, 24), 1))
-        p.setBrush(QColor(16, 24, 32))
-        p.drawRoundedRect(QRectF(cx - tower_w / 2, base_y - 46, tower_w, 60),
-                          10, 10)
-        p.setBrush(QColor(22, 32, 42))
-        p.drawRoundedRect(QRectF(cx - tower_w / 2 + 24, base_y - 66,
-                                 tower_w - 48, 26), 8, 8)
         az_deg, lift, _, _ = self._gun_geometry(w, h, cx)
         rec = self.recoil * 16
+        p.setPen(QPen(Qt.NoPen))
+        # 炮舰甲板：梯形剪影 + 甲板边缘线
+        deck = QLinearGradient(0, base_y - 6, 0, h)
+        deck.setColorAt(0, QColor(24, 36, 48))
+        deck.setColorAt(1, QColor(7, 12, 20))
+        path = QPainterPath()
+        path.moveTo(cx - 340, h)
+        path.lineTo(cx - 235, base_y - 6)
+        path.lineTo(cx + 235, base_y - 6)
+        path.lineTo(cx + 340, h)
+        path.closeSubpath()
+        p.setBrush(deck)
+        p.drawPath(path)
+        p.setPen(QPen(QColor(74, 96, 116, 110), 1))
+        p.drawLine(QPointF(cx - 235, base_y - 6),
+                   QPointF(cx + 235, base_y - 6))
+        # 炮座转盘环（两层椭圆）
+        p.setPen(QPen(QColor(10, 16, 24), 1))
+        p.setBrush(QColor(18, 28, 40))
+        p.drawEllipse(QPointF(cx, base_y - 10), 104, 15)
+        p.setBrush(QColor(30, 44, 58))
+        p.drawEllipse(QPointF(cx, base_y - 16), 86, 12)
+        # 炮塔主体：梯形缩厚装甲，顶亮底暗金属渐变
+        body = QLinearGradient(0, base_y - 110, 0, base_y - 24)
+        body.setColorAt(0, QColor(58, 76, 94))
+        body.setColorAt(0.55, QColor(32, 46, 62))
+        body.setColorAt(1, QColor(13, 20, 30))
+        t = QPainterPath()
+        t.moveTo(cx - 92, base_y - 24)
+        t.lineTo(cx - 74, base_y - 96)
+        t.lineTo(cx + 74, base_y - 96)
+        t.lineTo(cx + 92, base_y - 24)
+        t.closeSubpath()
+        p.setPen(QPen(QColor(8, 14, 22), 1.5))
+        p.setBrush(body)
+        p.drawPath(t)
+        # 顶盖与测距仪鼓包
+        p.setPen(QPen(QColor(10, 16, 26), 1))
+        p.setBrush(QColor(64, 84, 104))
+        p.drawRoundedRect(QRectF(cx - 76, base_y - 108, 152, 14), 4, 4)
+        p.setBrush(QColor(46, 62, 80))
+        p.drawRoundedRect(QRectF(cx - 20, base_y - 122, 40, 16), 5, 5)
+        # 装甲缝高光
+        p.setPen(QPen(QColor(126, 156, 182, 60), 1))
+        p.drawLine(QPointF(cx - 70, base_y - 92), QPointF(cx + 70, base_y - 92))
+        p.drawLine(QPointF(cx - 88, base_y - 32), QPointF(cx + 88, base_y - 32))
+        # 火炮：方位整体旋转，俯仰/后坐沿纵深方向抬升
         p.save()
-        p.translate(cx, base_y - 56)
-        p.rotate(az_deg)                            # 方位：炮管整体摆动
-        for off, xb in ((-24.0, -13.0), (24.0, 13.0)):
-            ty = -(150.0 + lift) - rec              # 俯仰：炮口上抬
-            p.setPen(QPen(QColor(30, 40, 52), 13, Qt.SolidLine,
-                          Qt.RoundCap))
-            p.drawLine(QPointF(xb, 0), QPointF(off, ty * 0.6))
-            p.setPen(QPen(QColor(48, 62, 78), 13, Qt.SolidLine,
-                          Qt.RoundCap))
-            p.drawLine(QPointF(off, ty * 0.6), QPointF(off, ty))
-            if self.muzzle > 0:
+        p.translate(cx, base_y - 60)
+        p.rotate(az_deg)
+        piv_y = -40.0                                   # 耳轴轴心（局部坐标）
+        tip_y = piv_y - (178.0 + lift) - rec             # 炮口：俯仰抬高+后坐
+        for xb in (-27.0, 27.0):                         # 左右炮身轴
+            tip_x = xb * 0.62                             # 炮口略微内收
+            p.setPen(QPen(QColor(10, 16, 24), 1))
+            p.setBrush(QColor(38, 52, 68))                # 耳轴座/炮盾
+            p.drawRoundedRect(QRectF(xb - 14, piv_y - 14, 28, 30), 5, 5)
+            p.setBrush(QColor(54, 72, 92))                # 炮尾衬套环
+            p.drawRoundedRect(QRectF(xb - 9, piv_y - 24, 18, 12), 3, 3)
+            # 炮身：深色底 + 上表面高光条（金属圆柱感），向纵深变细
+            p.setPen(QPen(QColor(22, 32, 44), 13, Qt.SolidLine, Qt.FlatCap))
+            p.drawLine(QPointF(xb, piv_y - 16), QPointF(tip_x, tip_y + 12))
+            p.setPen(QPen(QColor(26, 36, 50), 10, Qt.SolidLine, Qt.FlatCap))
+            p.drawLine(QPointF(tip_x, tip_y + 12), QPointF(tip_x, tip_y))
+            p.setPen(QPen(QColor(88, 112, 138, 150), 3, Qt.SolidLine,
+                          Qt.FlatCap))
+            p.drawLine(QPointF(xb - 3.6, piv_y - 16),
+                       QPointF(tip_x - 3.6, tip_y + 10))
+            # 炮口箍：加厚段 + 亮端面刻线
+            p.setPen(QPen(QColor(16, 26, 38), 17, Qt.SolidLine, Qt.FlatCap))
+            p.drawLine(QPointF(tip_x, tip_y + 14), QPointF(tip_x, tip_y))
+            p.setPen(QPen(QColor(120, 150, 178, 200), 2))
+            p.drawLine(QPointF(tip_x - 8, tip_y + 2),
+                       QPointF(tip_x + 8, tip_y + 2))
+            if self.muzzle > 0:                           # 炮口焰
                 fr = self.muzzle / 0.22
-                g = QRadialGradient(QPointF(off, ty - 6), 34 * fr + 6)
+                g = QRadialGradient(QPointF(tip_x, tip_y - 6), 34 * fr + 6)
                 g.setColorAt(0, QColor(255, 250, 200, int(255 * fr)))
                 g.setColorAt(0.4, QColor(255, 170, 60, int(200 * fr)))
                 g.setColorAt(1, QColor(255, 100, 20, 0))
                 p.setPen(QPen(Qt.NoPen))
                 p.setBrush(g)
-                p.drawEllipse(QPointF(off, ty - 6), 34 * fr + 6, 30 * fr + 5)
+                p.drawEllipse(QPointF(tip_x, tip_y - 6), 34 * fr + 6,
+                              30 * fr + 5)
         p.restore()
 
     def _paint_reticle(self, p, cx, horizon, f, w, h):
@@ -769,16 +902,20 @@ class AttackView(QDialog):
         t = QFont(FONT_HUD)
         t.setPixelSize(13)
         p.setFont(t)
-        # 左上：战术数据
+        # 左上：战术数据（鱼雷无弹道下垂，需抬高恒为 0）
+        shell = WEAPONS[self.weapon].kind == "shell"
         p.setPen(QPen(QColor(120, 255, 200, 230), 1))
         lines = [
             "敌舰距离  %6.2f km" % (e.rng / 1000),
             "敌舰方位  %+6.1f°   航速 %2.0f 节" % (
                 math.degrees(e.brg), e.speed),
-            "弹丸飞行  %5.1f s    下垂 %5.1f m" % (tof, drop_meters(tof)),
+            "弹丸飞行  %5.1f s    下垂 %5.1f m" % (tof, drop_meters(tof))
+            if shell else
+            "鱼雷航渡  %5.1f s    直航无下垂" % tof,
             "需抬高    %5.1f moa   当前 %5.1f" % (
                 drop_moa(e.rng, tof) * 0.001 * RAD_TO_MOA,
-                self.aim_elev * RAD_TO_MOA),
+                self.aim_elev * RAD_TO_MOA) if shell else
+            "需抬高    %5.1f moa   （鱼雷无需俯仰）" % 0.0,
             "本船航速 %3.0f 节  航向 %03.0f°（WASD 操船）" % (
                 self.own_world["spd"], self.own_world["hdg"] % 360.0),
         ]
@@ -870,10 +1007,15 @@ class AttackView(QDialog):
               ("本船被击沉…… 剩余敌血量 %d/1000" % self.enemy.hp)
         p.drawText(QRectF(0, h * 0.36 + 48, w, 24), Qt.AlignCenter, msg)
         p.drawText(QRectF(0, h * 0.36 + 78, w, 20), Qt.AlignCenter,
-                   "按 Enter 或点击右上角按钮返回雷达控制台")
+                   "%.1f 秒后自动返回雷达控制台（Enter 立即返回）"
+                   % max(0.0, 3.5 - self.over_t))
 
     # ---------------- 退出 ----------------
     def _quit(self):
+        if self._closed:
+            return
+        self._closed = True
+        self.timer.stop()
         self._sync_state()          # 世界坐标/血量回写共享 state（下次续战/雷达同步）
         if self.over == "win":
             report = "战斗胜利：击沉敌舰，本船损伤 %d%%" % \

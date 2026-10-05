@@ -1,13 +1,16 @@
-"""攻击模块音效 —— 纯标准库程序化合成 WAV 字节流，winsound 异步播放。
+"""攻击模块音效 —— 纯标准库程序化合成 WAV 字节流，后台线程阻塞播放。
 
 无任何音频素材依赖；非 Windows / 无音频设备环境自动静默降级不抛异常。
-对外仅暴露 fire() / torp() / hit() / splash() / incoming() 五个函数。
+注意：Win32 PlaySound 的 SND_MEMORY 不支持 SND_ASYNC（组合会报错），
+因此用守护线程逐条阻塞播放，既不卡主循环又避免新声掉旧声。
+对外暴露 fire() / torp() / hit() / splash() / explode() / sink() / incoming()。
 """
 
 import io
 import math
 import random
 import struct
+import threading
 import wave
 
 try:
@@ -116,9 +119,16 @@ def _play(name):
         data = _cache.get(name)
         if data is None:
             data = _cache[name] = _wav_bytes(_SOUNDS[name]())
-        winsound.PlaySound(data, winsound.SND_MEMORY | winsound.SND_ASYNC)
     except Exception:
-        pass                       # 音频异常不影响战斗逻辑
+        return                       # 合成失败静默，不影响战斗逻辑
+
+    def _run(buf=data):
+        try:   # SND_MEMORY 阻塞播放（不能与 SND_ASYNC 组合），在守护线程里逐条播完
+            winsound.PlaySound(buf, winsound.SND_MEMORY)
+        except Exception:
+            pass
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 def fire():
