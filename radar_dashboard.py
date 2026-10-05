@@ -292,7 +292,7 @@ class RadarScope(QWidget):
         self.contacts = []
         self.selected = None
         self.target_selected.emit(None)
-        if scale_nm and 0.5 <= scale_nm <= 60:
+        if scale_nm and 0.5 <= scale_nm <= 100:
             self.scale_nm = float(scale_nm)
             self.range_synced.emit(self.scale_nm)
         self.alarm_event.emit(
@@ -995,7 +995,7 @@ class Dashboard(QWidget):
         lay.addSpacing(10)
         lay.addWidget(QLabel("量程"))
         self.cmb_range = QComboBox()
-        for v in (2, 4, 6, 8, 12, 16):
+        for v in (2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 100):
             self.cmb_range.addItem("%d 海里" % v, v)
         self.cmb_range.setCurrentIndex(3)
         self.cmb_range.currentIndexChanged.connect(self._set_range)
