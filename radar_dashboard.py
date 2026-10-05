@@ -28,6 +28,12 @@ import osm_geo
 
 FONT_DIG = QFont("Consolas", 10)
 FONT_SMALL = QFont("Consolas", 8)
+# Consolas 无中文字形，显式声明中文回退，避免字体替换后行高超出文本框被裁半截
+for _f in (FONT_DIG, FONT_SMALL):
+    try:
+        _f.setFamilies(["Consolas", "Microsoft YaHei", "SimSun"])
+    except AttributeError:
+        pass
 
 PORT_RX = 5678   # 接收测试台注入的目标
 PORT_TX = 5679   # 向测试台回报本船动态
@@ -553,7 +559,7 @@ class RadarScope(QWidget):
             pt = self._w2s(x, y, cx, cy, R)
             if pt is None:
                 continue
-            p.drawText(QRectF(pt.x() + 3, pt.y() - 8, 120, 12),
+            p.drawText(QRectF(pt.x() + 3, pt.y() - 9, 120, 18),
                        Qt.AlignLeft, name)
         p.restore()
 
@@ -592,7 +598,7 @@ class RadarScope(QWidget):
         p.drawEllipse(QPointF(cx, cy), r, r)
         pt = polar_to_screen(cx, cy, 200, r)
         p.setPen(QPen(QColor(255, 120, 120, 150), 1))
-        p.drawText(QRectF(pt.x(), pt.y(), 80, 12), Qt.AlignLeft, "警戒区")
+        p.drawText(QRectF(pt.x(), pt.y(), 80, 18), Qt.AlignLeft, "警戒区")
 
     def _draw_sweep(self, p, cx, cy, R):
         p.setPen(Qt.NoPen)
@@ -622,14 +628,14 @@ class RadarScope(QWidget):
 
     def _draw_label(self, p, pt, text, qcolor, w, h):
         """标签自动避让：靠近右边缘时绘制在点左侧，避免被裁切。"""
-        box_w, box_h = 110.0, 15.0
+        box_w, box_h = 110.0, 18.0
         if pt.x() + 12 + box_w > w - 4:
-            rect = QRectF(pt.x() - 12 - box_w, pt.y() - 17, box_w, box_h)
+            rect = QRectF(pt.x() - 12 - box_w, pt.y() - 18, box_w, box_h)
             align = Qt.AlignRight | Qt.AlignVCenter
         else:
-            rect = QRectF(pt.x() + 12, pt.y() - 17, box_w, box_h)
+            rect = QRectF(pt.x() + 12, pt.y() - 18, box_w, box_h)
             align = Qt.AlignLeft | Qt.AlignVCenter
-        rect.moveTop(max(2.0, min(rect.top(), h - 18.0)))
+        rect.moveTop(max(2.0, min(rect.top(), h - box_h - 2.0)))
         p.setFont(FONT_DIG)
         p.setPen(QPen(qcolor, 1))
         p.drawText(rect, align, text)
@@ -690,12 +696,13 @@ class RadarScope(QWidget):
                 p.setPen(Qt.NoPen)
                 p.setBrush(core)
                 p.drawEllipse(pt, 2.6 + 2.2 * b, 2.6 + 2.2 * b)
-            # 相对速度矢量(被照亮时可见)
+            # 目标航向示意线：指向目标真航向（与本船转向无关）；
+            # 船首向上模式下随屏幕整体旋转，与目标位置口径一致
             if b > 0.12:
-                rvx = c.vx - self.own_spd * math.sin(math.radians(self.own_hdg))
-                rvy = c.vy - self.own_spd * math.cos(math.radians(self.own_hdg))
-                scale = 0.22 * R / self.scale_nm
-                ep = QPointF(pt.x() + rvx * scale, pt.y() - rvy * scale)
+                L = 12.0 + min(16.0, c.speed * 0.7)
+                h = math.radians(c.heading)
+                ep = polar_to_screen(pt.x(), pt.y(),
+                                     self._disp_brg(math.sin(h), math.cos(h)), L)
                 p.setPen(QPen(QColor(140, 255, 200, int(150 * b)), 1))
                 p.drawLine(pt, ep)
             # 标签：名称 + 距离（不再因扫描亮度衰减而丢失，且自动避让边缘）

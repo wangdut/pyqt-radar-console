@@ -26,6 +26,12 @@ import osm_geo
 
 FONT_DIG = QFont("Consolas", 10)
 FONT_SMALL = QFont("Consolas", 8)
+# Consolas 无中文字形，显式声明中文回退，避免字体替换后行高超出文本框被裁半截
+for _f in (FONT_DIG, FONT_SMALL):
+    try:
+        _f.setFamilies(["Consolas", "Microsoft YaHei", "SimSun"])
+    except AttributeError:
+        pass
 
 PORT_TO_RADAR = 5678   # 注入目标
 PORT_FROM_RADAR = 5679  # 本船动态回报
@@ -151,7 +157,7 @@ class WorldChart(QWidget):
             p.drawLine(pt, QPointF(pt.x() + math.sin(v) * 14, pt.y() - math.cos(v) * 14))
             p.setPen(QPen(QColor(210, 240, 255, 230), 1))
             p.setFont(FONT_DIG)
-            p.drawText(QRectF(pt.x() + 8, pt.y() - 20, 120, 14), Qt.AlignLeft, name)
+            p.drawText(QRectF(pt.x() + 8, pt.y() - 22, 120, 18), Qt.AlignLeft, name)
         # 选点十字
         if self.pick:
             pt = self.world_to_screen(*self.pick)
@@ -227,7 +233,7 @@ class WorldChart(QWidget):
                 continue
             pt = self.world_to_screen(x, y)
             if 0 < pt.x() < w and 0 < pt.y() < h:
-                p.drawText(QRectF(pt.x() + 4, pt.y() - 8, 140, 12), Qt.AlignLeft, name)
+                p.drawText(QRectF(pt.x() + 4, pt.y() - 9, 140, 18), Qt.AlignLeft, name)
 
     def wheelEvent(self, ev):
         d = ev.angleDelta().y()
