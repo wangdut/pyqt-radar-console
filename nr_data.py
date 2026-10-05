@@ -79,8 +79,8 @@ def _hit(idx, w, s, e, n):
     return not (idx[2] < w or idx[0] > e or idx[3] < s or idx[1] > n)
 
 
-def _clip_closed(pts, w, s, e, n):
-    """Sutherland-Hodgman 矩形裁剪，保持闭合环（用于陆地填充）。"""
+def clip_closed(pts, w, s, e, n):
+    """Sutherland-Hodgman 矩形裁剪，保持闭合环（供本地裁剪及雷达端渲染复用）。"""
     res = pts
     for axis, val, keep_ge in ((0, w, True), (0, e, False),
                                (1, s, True), (1, n, False)):
@@ -136,7 +136,7 @@ def fetch_bbox(bbox, max_places=40):
         geo = {"coast": [], "land": [], "water": [], "places": []}
         for idx in _land_rings:
             if _hit(idx, W, S, E, N):
-                ring = _clip_closed(idx[4], W, S, E, N)
+                ring = clip_closed(idx[4], W, S, E, N)
                 if len(ring) >= 3:
                     geo["land"].append(ring)
         for idx in _coast_lines:

@@ -22,6 +22,7 @@ from PyQt5.QtWidgets import (QApplication, QComboBox, QDoubleSpinBox, QFrame,
                              QSizePolicy, QSlider, QSplitter, QVBoxLayout,
                              QWidget)
 
+import nr_data
 import osm_client
 import osm_geo
 
@@ -192,6 +193,11 @@ class RadarScope(QWidget):
         self.map_thread = None
         self.spawn_ll = None          # (lat, lon)
         self.map_loaded = False
+        self.map_cov = 0.0            # 已加载地图数据的矩形半宽（海里）
+        self.map_cx = 0.0             # 已加载矩形的中心（世界坐标）
+        self.map_cy = 0.0
+        self._map_bbox = None         # 最近一次取数请求的 bbox（用于丢弃过期回报）
+        self._land_cache = None       # (key, 裁剪后陆地环) 渲染缓存
         # UDP：接收目标注入 / 回报本船动态
         self.rx = QUdpSocket(self)
         self.bind_ok = self.rx.bind(QHostAddress.Any, PORT_RX)
@@ -293,16 +299,40 @@ class RadarScope(QWidget):
             "info", "本船降生于 %0.4f%s %0.4f%s，正在加载真实地图…" % (
                 abs(lat), "N" if lat >= 0 else "S",
                 abs(lon), "E" if lon >= 0 else "W"))
-        half = max(self.scale_nm * 1.8, 12.0)
-        bbox = self.region.bbox_of(0.0, 0.0, half)
+        self.map_cov = max(self.scale_nm * 1.8, 12.0)
+        self.map_cx, self.map_cy = 0.0, 0.0
+        self._start_map(self.region.bbox_of(0.0, 0.0, self.map_cov))
+
+    def _start_map(self, bbox):
+        self._map_bbox = bbox
         if self.map_thread is not None and self.map_thread.isRunning():
-            self.map_thread.done.disconnect()
-            self.map_thread.wait(200)
+            try:
+                self.map_thread.done.disconnect()
+            except TypeError:
+                pass
+            # 超时不死等（避免阻塞 UI），旧线程晚到的结果由 _map_bbox 校验丢弃
+            self.map_thread.finished.connect(self.map_thread.deleteLater)
+            self.map_thread.wait(50)
         self.map_thread = osm_client.MapThread(bbox, self)
         self.map_thread.done.connect(self._on_map_done)
         self.map_thread.start()
 
+    def map_refresh(self):
+        """量程调大/本船驶离已加载窗口时，以当前船位为中心重新加载地图
+        （仅换数据窗口，不重置本船与目标）。"""
+        if self.region is None:
+            return
+        need = self.scale_nm * 1.35
+        ox, oy = self.own[0], self.own[1]
+        if max(abs(ox - self.map_cx), abs(oy - self.map_cy)) + need <= self.map_cov:
+            return
+        self.map_cov = max(self.scale_nm * 1.8, 12.0)
+        self.map_cx, self.map_cy = ox, oy
+        self._start_map(self.region.bbox_of(ox, oy, self.map_cov))
+
     def _on_map_done(self, bbox, geo):
+        if bbox != self._map_bbox:
+            return          # 过期线程的晚到结果，丢弃，避免旧地图覆盖新地图
         shapes = osm_client.to_world_shapes(geo, self.region)
         self.shapes = shapes
         self.map_loaded = shapes is not None
@@ -394,6 +424,7 @@ class RadarScope(QWidget):
         if self.sim_online and now - self._last_rx > 8.0:
             self.sim_online = False
             self.alarm_event.emit("warn", "目标测试台信号中断（8 秒未收到注入）")
+        self.map_refresh()
         self.update()
 
     # ---------------- 绘制 ----------------
@@ -450,10 +481,18 @@ class RadarScope(QWidget):
         dx = x - self.own[0]
         dy = y - self.own[1]
         rng = math.hypot(dx, dy)
-        if rng > self.scale_nm * 1.3:
+        if rng > self.scale_nm * 1.35:
             return None
         brg = self._disp_brg(dx, dy)
         return polar_to_screen(cx, cy, brg, R * rng / self.scale_nm)
+
+    def _w2s_all(self, x, y, cx, cy, R):
+        """同 _w2s 但不拒点（配合量程圆裁剪用于陆地填充，避免断线闭合产生割线）。"""
+        dx = x - self.own[0]
+        dy = y - self.own[1]
+        brg = self._disp_brg(dx, dy)
+        return polar_to_screen(cx, cy, brg,
+                               R * math.hypot(dx, dy) / self.scale_nm)
 
     def _draw_map(self, p, cx, cy, R):
         sh = self.shapes
@@ -463,24 +502,30 @@ class RadarScope(QWidget):
         p.setRenderHint(QPainter.Antialiasing, True)
         land_fill = QColor(43, 74, 52, 225)
         land_edge = QColor(140, 224, 168, 210)
-        # 闭合陆地/岛屿：填充 + 描边
-        for poly in sh["land"]:
+        # 闭合陆地/岛屿：先按视口矩形裁剪整环再填充（paintEvent 已裁圆形量程），
+        # 不能逐点断线，否则填充自动闭合会产生直线割痕；
+        # 裁剪结果缓存，船位/量程/数据未变时直接复用，避免每帧重裁
+        need = self.scale_nm * 1.35
+        key = (round(self.own[0], 2), round(self.own[1], 2),
+               round(self.scale_nm, 3), id(sh["land"]))
+        if not self._land_cache or self._land_cache[0] != key:
+            xmin, ymin = self.own[0] - need, self.own[1] - need
+            xmax, ymax = self.own[0] + need, self.own[1] + need
+            rings = []
+            for poly in sh["land"]:
+                ring = nr_data.clip_closed(poly, xmin, ymin, xmax, ymax)
+                if len(ring) >= 3:
+                    rings.append(ring)
+            self._land_cache = (key, rings)
+        for ring in self._land_cache[1]:
             path = QPainterPath()
-            started = False
-            for (x, y) in poly:
-                pt = self._w2s(x, y, cx, cy, R)
-                if pt is None:
-                    started = False
-                    continue
-                if not started:
-                    path.moveTo(pt)
-                    started = True
-                else:
-                    path.lineTo(pt)
-            if not path.isEmpty():
-                p.setPen(QPen(land_edge, 1.0))
-                p.setBrush(land_fill)
-                p.drawPath(path)
+            path.moveTo(self._w2s_all(ring[0][0], ring[0][1], cx, cy, R))
+            for (x, y) in ring[1:]:
+                path.lineTo(self._w2s_all(x, y, cx, cy, R))
+            path.closeSubpath()
+            p.setPen(QPen(land_edge, 1.0))
+            p.setBrush(land_fill)
+            p.drawPath(path)
         # 开弧海岸线
         p.setBrush(Qt.NoBrush)
         p.setPen(QPen(QColor(160, 240, 200, 190), 1.4))
@@ -1005,6 +1050,7 @@ class Dashboard(QWidget):
 
     def _set_range(self):
         self.scope.scale_nm = float(self.cmb_range.currentData())
+        self.scope.map_refresh()
 
     def _on_range_synced(self, nm):
         """降生时同步量程下拉框（取最接近的预设项）。"""
@@ -1016,6 +1062,7 @@ class Dashboard(QWidget):
         self.cmb_range.blockSignals(True)
         self.cmb_range.setCurrentIndex(best_i)
         self.cmb_range.blockSignals(False)
+        self.scope.map_refresh()
 
     def _on_select(self, contact):
         if contact is None:
