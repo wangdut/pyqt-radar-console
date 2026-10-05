@@ -31,6 +31,8 @@ PORT_TO_RADAR = 5678   # 注入目标
 PORT_FROM_RADAR = 5679  # 本船动态回报
 DEFAULT_SPAWN = (39.00, 118.05)  # 初始降生：渤海湾天津近海 (lat, lon)
 SUGGEST_SCALE = 12.0   # 降生时建议给雷达的量程
+SPAN_MIN = 2.0         # 海图视图半径（海里）缩放下限
+SPAN_MAX = 15000.0     # 缩放上限：覆盖整张世界地图
 
 QSS = """
 QWidget {
@@ -172,14 +174,17 @@ class WorldChart(QWidget):
         # 状态角标
         p.setPen(QPen(QColor(0, 229, 255, 170), 1))
         p.setFont(FONT_DIG)
-        p.drawText(10, 20, "视图半径 %.0f 海里   滚轮缩放" % span)
+        if span > 1200:
+            p.drawText(10, 20, "世界视图 %.0f 海里   滚轮放大可回到近岸" % span)
+        else:
+            p.drawText(10, 20, "视图半径 %.0f 海里   滚轮缩放" % span)
         p.end()
 
     def _grid_step(self, span):
-        for s in (1, 2, 5, 10, 20, 50):
+        for s in (1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000):
             if span / s <= 8:
                 return s
-        return 100
+        return 10000
 
     def _draw_map(self, p, w, h):
         sh = self.owner.shapes
@@ -228,7 +233,7 @@ class WorldChart(QWidget):
         d = ev.angleDelta().y()
         if d == 0:
             return
-        factor = 1.2 if d < 0 else (1.0 / 1.2)
+        factor = 1.25 if d < 0 else (1.0 / 1.25)
         self.owner.set_chart_span(self.owner.chart_span * factor)
         ev.accept()
 
@@ -312,7 +317,7 @@ class Tester(QWidget):
 
     def _build_side(self):
         side = QWidget()
-        side.setFixedWidth(340)
+        side.setFixedWidth(390)
         col = QVBoxLayout(side)
         col.setContentsMargins(0, 0, 0, 0)
         col.setSpacing(10)
@@ -356,11 +361,16 @@ class Tester(QWidget):
         self.spn_lat.setDecimals(4)
         self.spn_lat.setValue(DEFAULT_SPAWN[0])
         self.spn_lat.setSuffix(" °N")
+        self.spn_lat.setMinimumWidth(150)
+        self.spn_lat.lineEdit().returnPressed.connect(self._spawn_from_spins)
         self.spn_lon = QDoubleSpinBox()
         self.spn_lon.setRange(-179.9, 179.9)
         self.spn_lon.setDecimals(4)
         self.spn_lon.setValue(DEFAULT_SPAWN[1])
         self.spn_lon.setSuffix(" °E")
+        self.spn_lon.setMinimumWidth(150)
+        self.spn_lon.lineEdit().returnPressed.connect(self._spawn_from_spins)
+        g.setColumnStretch(1, 1)
         g.addWidget(kl1, 0, 0); g.addWidget(self.spn_lat, 0, 1)
         g.addWidget(kl2, 1, 0); g.addWidget(self.spn_lon, 1, 1)
         pl.addLayout(g)
@@ -377,9 +387,15 @@ class Tester(QWidget):
         self.lbl_map = QLabel("地图：加载中…")
         self.lbl_map.setObjectName("Hint")
         pl.addWidget(self.lbl_map)
-        btn_reload = QPushButton("↻ 重新加载地图")
+        row3 = QHBoxLayout()
+        btn_reload = QPushButton("↻ 重载地图")
         btn_reload.clicked.connect(self.reload_map)
-        pl.addWidget(btn_reload)
+        btn_world = QPushButton("🌍 世界视图")
+        btn_world.setToolTip("缩小到整张世界地图，可任意点选/投远海降生点")
+        btn_world.clicked.connect(lambda: self.set_chart_span(SPAN_MAX, force=True))
+        row3.addWidget(btn_reload)
+        row3.addWidget(btn_world)
+        pl.addLayout(row3)
         return panel
 
     def _build_target_panel(self):
@@ -526,9 +542,10 @@ class Tester(QWidget):
                          len(self.shapes["places"])))
         self.chart.update()
 
-    def set_chart_span(self, span):
-        self.chart_span = max(2.0, min(60.0, span))
-        if self.chart_span > self.map_cov * 0.7:
+    def set_chart_span(self, span, force=False):
+        span = max(SPAN_MIN, min(SPAN_MAX, span))
+        self.chart_span = span
+        if force or span > self.map_cov * 0.7:
             self.reload_map()
         self.chart.update()
 

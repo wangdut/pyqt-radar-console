@@ -36,7 +36,9 @@ def _cache_path(bbox):
 
 
 def _query(bbox):
-    s, w, n, e = ["%.5f" % v for v in bbox]
+    s = max(-89.9, bbox[0]); w = max(-179.9, bbox[1])
+    n = min(89.9, bbox[2]); e = min(179.9, bbox[3])
+    s, w, n, e = ["%.5f" % v for v in (s, w, n, e)]
     return (
         "[out:json][timeout:50];\n"
         "(way(%s,%s,%s,%s)[\"natural\"=\"coastline\"];\n"

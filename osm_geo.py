@@ -1,47 +1,31 @@
 # -*- coding: utf-8 -*-
-"""经纬度 <-> 海里平面坐标 投影工具（等角切平面近似，基于 Web Mercator/EPSG:3857）。
+"""经纬度 <-> 平面海里坐标 投影工具（等距圆柱/Plate Carrée 切平面近似）。
 
 雷达仿真内部使用“世界海里坐标”(x=东, y=北)，降生点(lat0, lon0)为原点。
-Mercator 是等角投影，切平面修正后局部角度/形状保持正确，适合海图展示。
+小范围(海图量程)下与真实球面误差可忽略；相比 Mercator，等距圆柱投影在
+大范围/世界视图下形变小、极地区不爆炸，支持把海图缩小到整张世界地图。
 """
 import math
 
 NM_M = 1852.0            # 1 海里 = 1852 米
 R = 6378137.0            # WGS84 赤道半径（米）
-
-
-def merc_x(lon):
-    return math.radians(lon) * R
-
-
-def merc_y(lat):
-    lat = math.radians(max(-89.999, min(89.999, lat)))
-    return math.log(math.tan(math.pi / 4.0 + lat / 2.0)) * R
-
-
-def inv_lon(x):
-    return math.degrees(x / R)
-
-
-def inv_lat(y):
-    return math.degrees(2.0 * math.atan(math.exp(y / R)) - math.pi / 2.0)
+NM_PER_DEG = 2.0 * math.pi * R / NM_M / 360.0   # 赤道处 1 度 ≈ 60.1 海里
 
 
 class GeoRegion:
     """以 (lon0, lat0) 为原点的局部投影。to_world 返回 (东海里, 北海里)。"""
 
     def __init__(self, lon0, lat0):
-        self.lon0, self.lat0 = lon0, lat0
-        self.mx0, self.my0 = merc_x(lon0), merc_y(lat0)
-        self.k = math.cos(math.radians(lat0))   # 该纬度处赤道尺度->真实尺度修正
+        self.lon0, self.lat0 = float(lon0), float(lat0)
+        self.k = math.cos(math.radians(self.lat0))   # 经度圈尺度修正
+        self.dx = NM_PER_DEG * max(1e-6, self.k)     # 每度经度 -> 海里
+        self.dy = NM_PER_DEG                          # 每度纬度 -> 海里
 
     def to_world(self, lon, lat):
-        return ((merc_x(lon) - self.mx0) * self.k / NM_M,
-                (merc_y(lat) - self.my0) * self.k / NM_M)
+        return ((lon - self.lon0) * self.dx, (lat - self.lat0) * self.dy)
 
     def to_ll(self, x, y):
-        return (inv_lon(self.mx0 + x * NM_M / self.k),
-                inv_lat(self.my0 + y * NM_M / self.k))
+        return (self.lon0 + x / self.dx, self.lat0 + y / self.dy)
 
     def bbox_of(self, x, y, half_nm):
         """以世界点为中心、半径 half_nm 海里的经纬度范围 (S, W, N, E)。"""
